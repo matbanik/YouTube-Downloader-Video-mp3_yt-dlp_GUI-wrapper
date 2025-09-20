@@ -1,4 +1,4 @@
-# YouTube Downloader GUI for yt-dl - with mp3 only support
+# YouTube Downloader GUI for yt-dlp - with mp3-only support
 
 A graphical user interface for downloading YouTube videos and playlists, built with Python's Tkinter library and powered by `yt-dlp`.
 
