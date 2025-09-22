@@ -50,7 +50,7 @@ tkinter (usually included with Python)
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/yourusername/youtube-downloader.git
+git clone https://github.com/matbanik/YouTube-Downloader-Video-mp3_yt-dlp_GUI-wrapper.git
 cd youtube-downloader
 ```
 
@@ -284,19 +284,6 @@ pip install --upgrade yt-dlp
 - **Threading**: Asynchronous downloads with progress reporting
 - **Data Persistence**: JSON-based settings and queue storage
 
-### File Structure
-```
-youtube-downloader/
-├── youtube_downloader.py    # Main application
-├── build.bat               # Windows build script
-├── settings.json           # User preferences (auto-generated)
-├── README.md              # This file
-├── YD.jpg                 # Application screenshot
-├── requirements.txt       # Python dependencies
-└── dist/                  # Built executable (after running build.bat)
-    └── yd.exe            # Standalone executable (FFmpeg not included)
-```
-
 ### External Dependencies
 - **FFmpeg**: Required for video processing, must be installed separately
 - **yt-dlp**: Bundled with executable or installed via pip
@@ -326,7 +313,7 @@ Please include:
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](./LICENSE) file for details.
 
 ## Acknowledgments
 
