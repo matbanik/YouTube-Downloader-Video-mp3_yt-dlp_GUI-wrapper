@@ -79,15 +79,26 @@ class YouTubeDownloaderApp:
         
         ttk.Label(options_frame, text="Quality:").pack(side=tk.LEFT, padx=(0, 5))
         self.quality_var = tk.StringVar(value='1080p')
-        quality_options = ['1080p', '720p', '480p', '360p']
-        self.quality_menu = ttk.OptionMenu(options_frame, self.quality_var, quality_options[0], *quality_options)
+        quality_options = ['Best', '1080p', '720p', '480p', '360p']
+        self.quality_menu = ttk.OptionMenu(options_frame, self.quality_var, quality_options[1], *quality_options)  # Default to 1080p, not Best
         self.quality_menu.pack(side=tk.LEFT, padx=(0, 20))
         
         self.audio_only_var = tk.BooleanVar()
-        self.audio_only_check = ttk.Checkbutton(options_frame, text="Audio Only (mp3)", variable=self.audio_only_var, command=self.on_audio_only_change)
+        self.audio_only_check = ttk.Checkbutton(options_frame, text="Audio Only", variable=self.audio_only_var, command=self.on_audio_only_change)
         self.audio_only_check.pack(side=tk.LEFT)
         
+        # Audio format dropdown (initially hidden)
+        self.audio_format_var = tk.StringVar(value='default')
+        self.audio_format_options = ['default (YouTube)', 'best (YouTube)', 'mp3 (FFmpeg)']
+        self.audio_format_menu = ttk.OptionMenu(options_frame, self.audio_format_var, self.audio_format_options[0], *self.audio_format_options)
+        self.audio_format_menu.pack(side=tk.LEFT, padx=(5, 0))
+        self.audio_format_menu.pack_forget()  # Hide initially
+        
+        # Check FFmpeg availability and update audio options
+        self.check_ffmpeg_availability()
+        
         self.quality_var.trace_add('write', self.on_setting_change)
+        self.audio_format_var.trace_add('write', self.on_setting_change)
 
         # --- Download Path Frame ---
         path_frame = ttk.Frame(top_frame)
@@ -119,6 +130,12 @@ class YouTubeDownloaderApp:
         
         self.skipped_label = tk.Label(status_summary_frame, text="Skipped: 0", font=("Arial", 9, "bold"), fg="purple")
         self.skipped_label.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.quality_blocked_label = tk.Label(status_summary_frame, text="QualityBlocked: 0", font=("Arial", 9, "bold"), fg="orange")
+        self.quality_blocked_label.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.age_restricted_label = tk.Label(status_summary_frame, text="AgeRestricted: 0", font=("Arial", 9, "bold"), fg="brown")
+        self.age_restricted_label.pack(side=tk.LEFT, padx=(0, 10))
         
         self.downloading_label = tk.Label(status_summary_frame, text="Downloading: 0", font=("Arial", 9, "bold"), fg="blue")
         self.downloading_label.pack(side=tk.LEFT)
@@ -221,6 +238,8 @@ class YouTubeDownloaderApp:
         self.tree.tag_configure('done', foreground='green')
         self.tree.tag_configure('failed', foreground='red')
         self.tree.tag_configure('skipped', foreground='purple')
+        self.tree.tag_configure('qualityblocked', foreground='orange')
+        self.tree.tag_configure('agerestricted', foreground='brown')
 
     def change_download_path(self):
         """Opens a dialog to choose a new download directory."""
@@ -251,11 +270,20 @@ class YouTubeDownloaderApp:
             self.is_updating_from_selection = True # Set flag to prevent trace callback
             
             quality = video_info['quality']
-            if quality == 'Audio':
+            if quality.startswith('Audio-'):
                 self.audio_only_var.set(True)
+                audio_format = quality.split('-')[1]  # Extract 'default', 'best' or 'mp3'
+                if audio_format == 'default':
+                    self.audio_format_var.set('default (YouTube)')
+                elif audio_format == 'best':
+                    self.audio_format_var.set('best (YouTube)')
+                else:
+                    self.audio_format_var.set('mp3 (FFmpeg)')
+                self.audio_format_menu.pack(side=tk.LEFT, padx=(5, 0), after=self.audio_only_check)
                 self.quality_menu.config(state=tk.DISABLED)
             else:
                 self.audio_only_var.set(False)
+                self.audio_format_menu.pack_forget()
                 self.quality_var.set(quality)
                 self.quality_menu.config(state=tk.NORMAL)
             
@@ -309,9 +337,15 @@ class YouTubeDownloaderApp:
         self.tree.config(cursor="")
 
     def on_audio_only_change(self):
-        """Handles audio only checkbox changes and disables quality dropdown."""
-        # Disable/enable quality dropdown based on audio only setting
-        self.quality_menu.config(state=tk.DISABLED if self.audio_only_var.get() else tk.NORMAL)
+        """Handles audio only checkbox changes and shows/hides audio format dropdown."""
+        if self.audio_only_var.get():
+            # Show audio format dropdown and disable quality dropdown
+            self.audio_format_menu.pack(side=tk.LEFT, padx=(5, 0), after=self.audio_only_check)
+            self.quality_menu.config(state=tk.DISABLED)
+        else:
+            # Hide audio format dropdown and enable quality dropdown
+            self.audio_format_menu.pack_forget()
+            self.quality_menu.config(state=tk.NORMAL)
         self.on_setting_change()
 
     def on_setting_change(self, *args):
@@ -323,7 +357,11 @@ class YouTubeDownloaderApp:
         if not selected_items:
             return
 
-        new_quality = 'Audio' if self.audio_only_var.get() else self.quality_var.get()
+        if self.audio_only_var.get():
+            audio_format = self.audio_format_var.get()
+            new_quality = f'Audio-{audio_format.split()[0]}'  # 'Audio-default', 'Audio-best' or 'Audio-mp3'
+        else:
+            new_quality = self.quality_var.get()
 
         for item_id in selected_items:
             # Update internal data
@@ -387,6 +425,37 @@ class YouTubeDownloaderApp:
             self.log_message(f"Error checking FFmpeg: {e}", "ERROR")
         
         self.log_message("Dependency check complete.", "INFO")
+        
+        # Refresh audio format options after dependency check
+        self.check_ffmpeg_availability()
+
+    def check_ffmpeg_availability(self):
+        """Check if FFmpeg is available and update audio format options accordingly."""
+        try:
+            result = subprocess.run(['ffmpeg', '-version'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                # FFmpeg is available, keep all options
+                self.ffmpeg_available = True
+                return
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        
+        # FFmpeg not available, disable mp3 option
+        self.ffmpeg_available = False
+        self.audio_format_options = ['default (YouTube)', 'best (YouTube)']
+        
+        # Update the menu
+        menu = self.audio_format_menu['menu']
+        menu.delete(0, 'end')
+        for option in self.audio_format_options:
+            menu.add_command(label=option, command=tk._setit(self.audio_format_var, option))
+        
+        # Reset to available option if currently set to unavailable one
+        if self.audio_format_var.get() == 'mp3 (FFmpeg)':
+            self.audio_format_var.set('default (YouTube)')
+            
+        self.log_message("FFmpeg not detected. MP3 transcoding disabled. Using native audio formats only.", "INFO")
 
     def add_url(self):
         """Handles adding a URL to the download queue."""
@@ -395,7 +464,11 @@ class YouTubeDownloaderApp:
             messagebox.showwarning("Warning", "URL field cannot be empty.")
             return
 
-        quality = 'Audio' if self.audio_only_var.get() else self.quality_var.get()
+        if self.audio_only_var.get():
+            audio_format = self.audio_format_var.get()
+            quality = f'Audio-{audio_format.split()[0]}'  # 'Audio-default', 'Audio-best' or 'Audio-mp3'
+        else:
+            quality = self.quality_var.get()
         self.url_entry.delete(0, tk.END)
         self.log_message("Processing URL... (This may take a moment for playlists)")
         threading.Thread(target=self._process_url, args=(url, quality), daemon=True).start()
@@ -471,7 +544,7 @@ class YouTubeDownloaderApp:
                     
                     # Auto-adjust quality for single video
                     adjusted_quality = quality
-                    if quality != 'Audio':
+                    if not quality.startswith('Audio-'):
                         adjusted_quality = self.check_and_adjust_single_video_quality(full_info, quality)
                     
                     videos_to_add.append({
@@ -479,7 +552,8 @@ class YouTubeDownloaderApp:
                         'id': full_info.get('id', 'N/A'), 
                         'url': full_info.get('webpage_url', url), 
                         'quality': adjusted_quality,
-                        'duration': duration
+                        'duration': duration,
+                        'info': full_info  # Store complete info object
                     })
                     self.log_message(f"Added video: {full_info.get('title')}")
             
@@ -503,11 +577,16 @@ class YouTubeDownloaderApp:
 
     def auto_adjust_quality(self, videos_to_add, requested_quality):
         """Auto-adjust video quality based on available formats."""
-        quality_hierarchy = ['1080p', '720p', '480p', '360p']
+        quality_hierarchy = ['Best', '1080p', '720p', '480p', '360p']
         adjusted_videos = []
         
         for video in videos_to_add:
-            if video['quality'] == 'Audio':
+            if video['quality'].startswith('Audio-'):
+                adjusted_videos.append(video)
+                continue
+            
+            # If "Best" is requested, no adjustment needed
+            if video['quality'] == 'Best':
                 adjusted_videos.append(video)
                 continue
                 
@@ -532,6 +611,12 @@ class YouTubeDownloaderApp:
                     
                     # Convert to quality strings
                     available_qualities = []
+                    max_height = max(available_heights) if available_heights else 0
+                    
+                    # Add "Best" if there are high-resolution formats available
+                    if max_height >= 1440:  # 1440p or higher
+                        available_qualities.append('Best')
+                    
                     for height in available_heights:
                         if height >= 1080:
                             available_qualities.append('1080p')
@@ -577,8 +662,12 @@ class YouTubeDownloaderApp:
         """Check and adjust quality for a single video based on available formats."""
         if not video_info.get('formats'):
             return requested_quality
+        
+        # If "Best" is requested, return it as-is (no adjustment needed)
+        if requested_quality == 'Best':
+            return requested_quality
             
-        quality_hierarchy = ['1080p', '720p', '480p', '360p']
+        quality_hierarchy = ['Best', '1080p', '720p', '480p', '360p']
         quality_to_height = {'1080p': 1080, '720p': 720, '480p': 480, '360p': 360}
         requested_height = quality_to_height.get(requested_quality, 1080)
         
@@ -614,7 +703,11 @@ class YouTubeDownloaderApp:
             best_height = max(available_heights)
         
         # Convert back to quality string
-        if best_height >= 1080:
+        if best_height >= 2160:
+            best_quality = 'Best'  # 4K or higher, use Best
+        elif best_height >= 1440:
+            best_quality = 'Best'  # 1440p, use Best
+        elif best_height >= 1080:
             best_quality = '1080p'
         elif best_height >= 720:
             best_quality = '720p'
@@ -631,6 +724,10 @@ class YouTubeDownloaderApp:
 
     def check_quality_before_download(self, video_info):
         """Check and adjust quality just before download."""
+        # Skip quality check for audio formats
+        if video_info['quality'].startswith('Audio-'):
+            return video_info['quality']
+            
         try:
             ydl_opts = {
                 'quiet': True,
@@ -938,12 +1035,7 @@ class YouTubeDownloaderApp:
                 current_index += 1
                 continue
             
-            # Check if file already exists
-            if self.check_file_exists(video_info, download_path):
-                self.root.after(0, self.update_video_status, video_info['item_id'], 'Skipped')
-                self.log_message(f"File already exists, skipping: {video_info['title']}")
-                current_index += 1
-                continue
+            # File existence check is now handled by yt-dlp's download archive
             
             try:
                 # Set status to downloading and track this video
@@ -952,7 +1044,7 @@ class YouTubeDownloaderApp:
                 self.log_message(f"Starting download: {video_info['title']}")
                 
                 # Auto-adjust quality if needed (for videos that weren't checked during URL processing)
-                if video_info['quality'] != 'Audio':
+                if not video_info['quality'].startswith('Audio-') and 'info' not in video_info:
                     original_quality = video_info['quality']
                     adjusted_quality = self.check_quality_before_download(video_info)
                     if adjusted_quality != original_quality:
@@ -963,24 +1055,47 @@ class YouTubeDownloaderApp:
                 self.last_progress_time = 0  # Reset progress timer for new download
                 self.stop_message_logged = False  # Reset stop message flag for new download
                 
-                if video_info['quality'] == 'Audio':
-                    ydl_opts = {
-                        'format': 'bestaudio/best', 
-                        'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'), 
-                        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}], 
-                        'progress_hooks': [self.progress_hook], 
-                        'nocheckcertificate': True
-                    }
+                # Setup yt-dlp options with download archive
+                ydl_opts = {
+                    'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'), 
+                    'progress_hooks': [self.progress_hook], 
+                    'nocheckcertificate': True,
+                    'download_archive': os.path.join(download_path, 'download-archive.txt'),  # Prevent re-downloads
+                    'ignoreerrors': True
+                }
+                
+                if video_info['quality'].startswith('Audio-'):
+                    audio_format = video_info['quality'].split('-')[1]  # 'default', 'best' or 'mp3'
+                    if audio_format == 'default':
+                        # Use default audio format (most compatible, fallback-friendly)
+                        ydl_opts['format'] = 'bestaudio/best'
+                        # No postprocessors - keep original format
+                    elif audio_format == 'best':
+                        # Use native audio format (no transcoding)
+                        ydl_opts['format'] = 'ba[acodec^=aac]/ba[acodec^=mp4a.40.]/ba/b'
+                        ydl_opts['postprocessors'] = [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': 'best',
+                            'preferredquality': '0',
+                            'nopostoverwrites': False,
+                        }]
+                    else:
+                        # Use mp3 format (with transcoding)
+                        ydl_opts['format'] = 'bestaudio/best'
+                        ydl_opts['postprocessors'] = [{
+                            'key': 'FFmpegExtractAudio', 
+                            'preferredcodec': 'mp3', 
+                            'preferredquality': '192'
+                        }]
                 else:
                     quality = video_info['quality']
-                    height = quality[:-1]  # Remove 'p' from '1080p'
-                    ydl_opts = {
-                        'format': f'bestvideo[height<={height}]+bestaudio/best[height<={height}]/best', 
-                        'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'), 
-                        'progress_hooks': [self.progress_hook], 
-                        'nocheckcertificate': True,
-                        'merge_output_format': 'mp4'  # Ensure output is mp4
-                    }
+                    if quality == 'Best':
+                        # Download best available quality without height restriction
+                        ydl_opts['format'] = 'bestvideo+bestaudio/best'
+                    else:
+                        height = quality[:-1]  # Remove 'p' from '1080p'
+                        ydl_opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]/best'
+                    ydl_opts['merge_output_format'] = 'mp4'  # Ensure output is mp4
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     # Store reference for potential termination
@@ -993,8 +1108,12 @@ class YouTubeDownloaderApp:
                         self.root.after(0, self.update_video_status, video_info['item_id'], 'Pending')
                         current_downloading_video = None
                         break
-                        
-                    ydl.download([video_info['url']])
+                    
+                    # Use stored info object if available, otherwise download by URL
+                    if 'info' in video_info and video_info['info']:
+                        ydl.process_ie_result(video_info['info'])
+                    else:
+                        ydl.download([video_info['url']])
 
                 if self.stop_event.is_set():
                     self.log_message("Download stopped by user after completing current video.", "WARNING")
@@ -1016,12 +1135,16 @@ class YouTubeDownloaderApp:
                         self.root.after(0, self.update_video_status, current_downloading_video['item_id'], 'Pending')
                         current_downloading_video = None
                     break
-                # Set status to failed and move to next video
-                self.root.after(0, self.update_video_status, video_info['item_id'], 'Failed')
+                
+                # Classify the error and set appropriate status
+                error_str = str(e)
+                status = self.classify_download_error(error_str, video_info)
+                
+                self.root.after(0, self.update_video_status, video_info['item_id'], status)
                 self.log_message(f"Error downloading {video_info['title']}: {e}", "ERROR")
                 
                 # Provide troubleshooting suggestions for common errors
-                self.suggest_troubleshooting(str(e))
+                self.suggest_troubleshooting(error_str)
                 current_downloading_video = None
                 current_index += 1
                 continue
@@ -1084,44 +1207,18 @@ class YouTubeDownloaderApp:
             elif status == 'Skipped':
                 current_values[4] = 'Skipped'
                 self.tree.item(item_id, values=current_values, tags=('skipped',))
+            elif status == 'QualityBlocked':
+                current_values[4] = 'QualityBlocked'
+                self.tree.item(item_id, values=current_values, tags=('qualityblocked',))
+            elif status == 'AgeRestricted':
+                current_values[4] = 'AgeRestricted'
+                self.tree.item(item_id, values=current_values, tags=('agerestricted',))
         
         # Update reset button state and status summary
         self.update_reset_button_state()
         self.update_status_summary()
 
-    def check_file_exists(self, video_info, download_path):
-        """Check if the video file already exists in the download folder."""
-        try:
-            # Create a temporary ydl instance to get the expected filename
-            if video_info['quality'] == 'Audio':
-                ydl_opts = {
-                    'format': 'bestaudio/best',
-                    'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
-                    'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-                    'quiet': True,
-                    'skip_download': True
-                }
-            else:
-                quality = video_info['quality']
-                ydl_opts = {
-                    'format': f'bestvideo[height<=?{quality[:-1]}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                    'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
-                    'quiet': True,
-                    'skip_download': True
-                }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_info['url'], download=False)
-                if info:
-                    filename = ydl.prepare_filename(info)
-                    if video_info['quality'] == 'Audio':
-                        # For audio, change extension to mp3
-                        filename = os.path.splitext(filename)[0] + '.mp3'
-                    return os.path.exists(filename)
-        except Exception as e:
-            self.log_message(f"Error checking file existence: {e}", "DEBUG")
-            return False
-        return False
+
 
     def reset_selected(self):
         """Reset selected videos by deleting files and setting status to Pending."""
@@ -1136,11 +1233,11 @@ class YouTubeDownloaderApp:
             current_values = self.tree.item(item_id, 'values')
             if len(current_values) >= 5:
                 status = current_values[4]
-                if status in ['Done', 'Failed', 'Skipped']:
+                if status in ['Done', 'Failed', 'Skipped', 'QualityBlocked', 'AgeRestricted']:
                     resetable_items.append(item_id)
         
         if not resetable_items:
-            messagebox.showinfo("Info", "No resetable videos selected. Only Done, Failed, or Skipped videos can be reset.")
+            messagebox.showinfo("Info", "No resetable videos selected. Only Done, Failed, Skipped, QualityBlocked, or AgeRestricted videos can be reset.")
             return
         
         if messagebox.askyesno("Confirm Reset", f"Are you sure you want to reset {len(resetable_items)} video(s)? This will delete existing files and restart the download."):
@@ -1155,37 +1252,48 @@ class YouTubeDownloaderApp:
                         break
                 
                 if video_info:
-                    # Try to delete existing file
+                    # Try to delete existing file and remove from download archive
                     try:
-                        if video_info['quality'] == 'Audio':
-                            ydl_opts = {
-                                'format': 'bestaudio/best',
-                                'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
-                                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-                                'quiet': True,
-                                'skip_download': True
-                            }
-                        else:
-                            quality = video_info['quality']
-                            ydl_opts = {
-                                'format': f'bestvideo[height<=?{quality[:-1]}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                                'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
-                                'quiet': True,
-                                'skip_download': True
-                            }
+                        # Remove from download archive if it exists
+                        archive_path = os.path.join(download_path, 'download-archive.txt')
+                        if os.path.exists(archive_path) and video_info.get('id'):
+                            with open(archive_path, 'r', encoding='utf-8') as f:
+                                lines = f.readlines()
+                            
+                            # Filter out the video ID from archive
+                            new_lines = [line for line in lines if not line.strip().endswith(video_info['id'])]
+                            
+                            if len(new_lines) != len(lines):
+                                with open(archive_path, 'w', encoding='utf-8') as f:
+                                    f.writelines(new_lines)
+                                self.log_message(f"Removed {video_info['title']} from download archive")
                         
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            info = ydl.extract_info(video_info['url'], download=False)
-                            if info:
-                                filename = ydl.prepare_filename(info)
-                                if video_info['quality'] == 'Audio':
-                                    filename = os.path.splitext(filename)[0] + '.mp3'
+                        # Try to find and delete the actual file (best effort)
+                        # This is less reliable but still useful for cleanup
+                        if video_info['quality'].startswith('Audio-'):
+                            audio_format = video_info['quality'].split('-')[1]
+                            if audio_format == 'default':
+                                # Default format - could be various audio formats
+                                possible_extensions = ['.webm', '.m4a', '.aac', '.mp3', '.ogg', '.opus']
+                            elif audio_format == 'best':
+                                # Could be m4a, aac, or other formats
+                                possible_extensions = ['.m4a', '.aac', '.webm', '.mp4']
+                            else:
+                                possible_extensions = ['.mp3']
+                        else:
+                            possible_extensions = ['.mp4', '.mkv', '.webm']
+                        
+                        # Try to find files with the video title
+                        title_safe = re.sub(r'[<>:"/\\|?*]', '_', video_info['title'])
+                        for ext in possible_extensions:
+                            potential_file = os.path.join(download_path, f"{title_safe}{ext}")
+                            if os.path.exists(potential_file):
+                                os.remove(potential_file)
+                                self.log_message(f"Deleted existing file: {os.path.basename(potential_file)}")
+                                break
                                 
-                                if os.path.exists(filename):
-                                    os.remove(filename)
-                                    self.log_message(f"Deleted existing file: {os.path.basename(filename)}")
                     except Exception as e:
-                        self.log_message(f"Error deleting file for {video_info['title']}: {e}", "WARNING")
+                        self.log_message(f"Error during reset for {video_info['title']}: {e}", "WARNING")
                     
                     # Reset status to Pending
                     self.update_video_status(item_id, 'Pending')
@@ -1202,7 +1310,7 @@ class YouTubeDownloaderApp:
             current_values = self.tree.item(item_id, 'values')
             if len(current_values) >= 5:
                 status = current_values[4]
-                if status in ['Done', 'Failed', 'Skipped']:
+                if status in ['Done', 'Failed', 'Skipped', 'QualityBlocked', 'AgeRestricted']:
                     resetable_count += 1
         
         if resetable_count > 0:
@@ -1221,6 +1329,8 @@ class YouTubeDownloaderApp:
         pending = sum(1 for v in self.download_queue if v.get('status', 'Pending') == 'Pending')
         failed = sum(1 for v in self.download_queue if v.get('status') == 'Failed')
         skipped = sum(1 for v in self.download_queue if v.get('status') == 'Skipped')
+        quality_blocked = sum(1 for v in self.download_queue if v.get('status') == 'QualityBlocked')
+        age_restricted = sum(1 for v in self.download_queue if v.get('status') == 'AgeRestricted')
         downloading = sum(1 for v in self.download_queue if v.get('status') == 'Downloading')
         
         # Update individual colored labels
@@ -1229,6 +1339,8 @@ class YouTubeDownloaderApp:
         self.pending_label.config(text=f"Pending: {pending}")
         self.failed_label.config(text=f"Failed: {failed}")
         self.skipped_label.config(text=f"Skipped: {skipped}")
+        self.quality_blocked_label.config(text=f"QualityBlocked: {quality_blocked}")
+        self.age_restricted_label.config(text=f"AgeRestricted: {age_restricted}")
         
         # Show/hide downloading label based on whether there are downloading items
         if downloading > 0:
@@ -1236,6 +1348,83 @@ class YouTubeDownloaderApp:
             self.downloading_label.pack(side=tk.LEFT, padx=(0, 10))
         else:
             self.downloading_label.pack_forget()
+
+    def classify_download_error(self, error_message, video_info):
+        """Classify download errors and return appropriate status."""
+        error_lower = error_message.lower()
+        
+        # Check for HTTP 403 Forbidden errors
+        if "http error 403" in error_lower or "403: forbidden" in error_lower:
+            self.log_message(f"HTTP 403 Forbidden detected for {video_info['title']} - Quality may be blocked", "WARNING")
+            
+            # Try to auto-retry with a different quality
+            if self.auto_retry_with_different_quality(video_info):
+                return 'Pending'  # Reset to pending for retry
+            else:
+                return 'QualityBlocked'
+        
+        # Check for age restriction errors
+        if any(phrase in error_lower for phrase in [
+            "age restricted", "age-restricted", "sign in to confirm your age",
+            "this video may be inappropriate", "content warning",
+            "requires age verification", "age gate"
+        ]):
+            self.log_message(f"Age restriction detected for {video_info['title']}", "WARNING")
+            return 'AgeRestricted'
+        
+        # Check for other specific error patterns
+        if "unavailable" in error_lower and "private" in error_lower:
+            return 'Failed'
+        
+        if "region" in error_lower and ("blocked" in error_lower or "restricted" in error_lower):
+            return 'Failed'
+        
+        # Default to Failed for other errors
+        return 'Failed'
+
+    def auto_retry_with_different_quality(self, video_info):
+        """Automatically retry with a different quality when 403 error occurs."""
+        current_quality = video_info['quality']
+        
+        # Handle audio format fallbacks
+        if current_quality.startswith('Audio-'):
+            audio_format = current_quality.split('-')[1]
+            # Audio format fallback hierarchy: best → default (no more fallbacks after default)
+            audio_fallback = {
+                'best': 'default'
+            }
+            
+            fallback_format = audio_fallback.get(audio_format)
+            if fallback_format:
+                fallback_quality = f'Audio-{fallback_format}'
+                self.log_message(f"Auto-retrying {video_info['title']} with audio format: {current_quality} → {fallback_quality}", "INFO")
+                video_info['quality'] = fallback_quality
+                
+                # Update GUI to show the new quality
+                self.root.after(0, self.update_video_quality_in_gui, video_info['item_id'], fallback_quality)
+                return True
+            
+            return False  # No more audio fallbacks available
+        
+        # Video quality fallback hierarchy
+        quality_fallback = {
+            'Best': '1080p',
+            '1080p': '720p', 
+            '720p': '480p',
+            '480p': '360p',
+            '360p': 'Audio-default'  # Final fallback to default audio
+        }
+        
+        fallback_quality = quality_fallback.get(current_quality)
+        if fallback_quality:
+            self.log_message(f"Auto-retrying {video_info['title']} with quality: {current_quality} → {fallback_quality}", "INFO")
+            video_info['quality'] = fallback_quality
+            
+            # Update GUI to show the new quality
+            self.root.after(0, self.update_video_quality_in_gui, video_info['item_id'], fallback_quality)
+            return True
+        
+        return False
 
     def suggest_troubleshooting(self, error_message):
         """Provide troubleshooting suggestions for common download errors."""
@@ -1277,6 +1466,25 @@ class YouTubeDownloaderApp:
             self.log_message("TROUBLESHOOTING: FFmpeg error. Solutions:", "WARNING")
             self.log_message("• Ensure FFmpeg is installed and in your PATH", "INFO")
             self.log_message("• Update FFmpeg to the latest version", "INFO")
+            
+        elif "http error 403" in error_lower or "403: forbidden" in error_lower:
+            self.log_message("TROUBLESHOOTING: HTTP 403 Forbidden - Quality may be blocked. Try:", "WARNING")
+            self.log_message("• Select a different quality (try 'Best' or lower quality)", "INFO")
+            self.log_message("• Use Audio Only mode instead", "INFO")
+            self.log_message("• The specific quality/format may be restricted for this video", "INFO")
+            self.log_message("• Try again later - YouTube may have temporary restrictions", "INFO")
+            self.log_message("• Some videos have quality-specific access restrictions", "INFO")
+            
+        elif any(phrase in error_lower for phrase in [
+            "age restricted", "age-restricted", "sign in to confirm your age",
+            "this video may be inappropriate", "content warning",
+            "requires age verification", "age gate"
+        ]):
+            self.log_message("TROUBLESHOOTING: Age Restricted content detected:", "WARNING")
+            self.log_message("• This video requires age verification on YouTube", "INFO")
+            self.log_message("• Age-restricted videos cannot be downloaded without authentication", "INFO")
+            self.log_message("• YouTube's age verification system blocks automated downloads", "INFO")
+            self.log_message("• Consider using a different video or check if it's available elsewhere", "INFO")
             self.log_message("• Try downloading as Audio Only to bypass video processing", "INFO")
 
     def progress_hook(self, d):
@@ -1385,7 +1593,8 @@ class YouTubeDownloaderApp:
             settings = {
                 'download_path': self.download_path.get(),
                 'log_level': self.log_level_var.get(),
-                'queue': [{k: v for k, v in video.items() if k != 'item_id'} for video in self.download_queue]
+                'audio_format': self.audio_format_var.get(),
+                'queue': [{k: v for k, v in video.items() if k not in ['item_id', 'info']} for video in self.download_queue]  # Exclude 'info' from saving
             }
             with open(SETTINGS_FILE, 'w') as f:
                 json.dump(settings, f, indent=4)
@@ -1405,6 +1614,10 @@ class YouTubeDownloaderApp:
                 # Load log level setting
                 log_level = settings.get('log_level', 'INFO')
                 self.log_level_var.set(log_level)
+                
+                # Load audio format setting
+                audio_format = settings.get('audio_format', 'default (YouTube)')
+                self.audio_format_var.set(audio_format)
 
                 loaded_queue = settings.get('queue', [])
                 if loaded_queue:
