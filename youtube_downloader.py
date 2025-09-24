@@ -602,29 +602,29 @@ class YouTubeDownloaderApp:
                     info = ydl.extract_info(video['url'], download=False)
                     
                 if info and 'formats' in info:
-                    available_heights = set()
+                    available_resolutions = set()
                     
-                    # Extract available video heights
+                    # Extract available video resolutions
                     for fmt in info['formats']:
-                        if fmt.get('vcodec') != 'none' and fmt.get('height'):
-                            available_heights.add(fmt['height'])
+                        if fmt.get('vcodec') != 'none' and (height := fmt.get('height')) and (width := fmt.get('width')):
+                            available_resolutions.add(min(height, width))  # Use the smaller dimension
                     
                     # Convert to quality strings
                     available_qualities = []
-                    max_height = max(available_heights) if available_heights else 0
+                    max_resolution = max(available_resolutions) if available_resolutions else 0
                     
                     # Add "Best" if there are high-resolution formats available
-                    if max_height >= 1440:  # 1440p or higher
+                    if max_resolution >= 1440:  # 1440p or higher
                         available_qualities.append('Best')
                     
-                    for height in available_heights:
-                        if height >= 1080:
+                    for resolution in available_resolutions:
+                        if resolution >= 1080:
                             available_qualities.append('1080p')
-                        elif height >= 720:
+                        elif resolution >= 720:
                             available_qualities.append('720p')
-                        elif height >= 480:
+                        elif resolution >= 480:
                             available_qualities.append('480p')
-                        elif height >= 360:
+                        elif resolution >= 360:
                             available_qualities.append('360p')
                     
                     # Remove duplicates and sort by quality hierarchy
@@ -668,57 +668,57 @@ class YouTubeDownloaderApp:
             return requested_quality
             
         quality_hierarchy = ['Best', '1080p', '720p', '480p', '360p']
-        quality_to_height = {'1080p': 1080, '720p': 720, '480p': 480, '360p': 360}
-        requested_height = quality_to_height.get(requested_quality, 1080)
+        quality_to_resolution = {'1080p': 1080, '720p': 720, '480p': 480, '360p': 360}
+        requested_resolution = quality_to_resolution.get(requested_quality, 1080)
         
-        available_heights = set()
+        available_resolutions = set()
         has_audio = False
         
-        # First, check what video heights are available and if there's audio
+        # First, check what video resolutions are available and if there's audio
         for fmt in video_info['formats']:
             # Check for video formats (including video-only)
-            if fmt.get('vcodec') != 'none' and fmt.get('height'):
-                available_heights.add(fmt['height'])
+            if fmt.get('vcodec') != 'none' and (height := fmt.get('height')) and (width := fmt.get('width')):
+                available_resolutions.add(min(height, width))  # Use the smaller dimension
             
             # Check if there's any audio available
             if fmt.get('acodec') != 'none':
                 has_audio = True
         
-        if not available_heights:
+        if not available_resolutions:
             self.log_message(f"No video formats found for '{video_info.get('title', 'Unknown')[:50]}...', keeping {requested_quality}", "DEBUG")
             return requested_quality
         
         if not has_audio:
             self.log_message(f"No audio formats found for '{video_info.get('title', 'Unknown')[:50]}...', but proceeding with video-only", "DEBUG")
         
-        # Find the best available height that matches or is closest to requested
+        # Find the best available resolution that matches or is closest to requested
         # First try to find exact match or higher
-        suitable_heights = [h for h in available_heights if h >= requested_height]
+        suitable_resolutions = [h for h in available_resolutions if h >= requested_resolution]
         
-        if suitable_heights:
-            # Use the lowest height that's >= requested (closest match)
-            best_height = min(suitable_heights)
+        if suitable_resolutions:
+            # Use the lowest resolution that's >= requested (closest match)
+            best_resolution = min(suitable_resolutions)
         else:
-            # If no height >= requested, use the highest available
-            best_height = max(available_heights)
+            # If no resolution >= requested, use the highest available
+            best_resolution = max(available_resolutions)
         
         # Convert back to quality string
-        if best_height >= 2160:
+        if best_resolution >= 2160:
             best_quality = 'Best'  # 4K or higher, use Best
-        elif best_height >= 1440:
+        elif best_resolution >= 1440:
             best_quality = 'Best'  # 1440p, use Best
-        elif best_height >= 1080:
+        elif best_resolution >= 1080:
             best_quality = '1080p'
-        elif best_height >= 720:
+        elif best_resolution >= 720:
             best_quality = '720p'
-        elif best_height >= 480:
+        elif best_resolution >= 480:
             best_quality = '480p'
         else:
             best_quality = '360p'
         
         # Only log adjustment if it actually changed and it's a significant change
         if best_quality != requested_quality:
-            self.log_message(f"Quality auto-adjusted: '{video_info.get('title', 'Unknown')[:50]}...' {requested_quality} → {best_quality} (available: {sorted(available_heights, reverse=True)})", "INFO")
+            self.log_message(f"Quality auto-adjusted: '{video_info.get('title', 'Unknown')[:50]}...' {requested_quality} → {best_quality} (available: {sorted(available_resolutions, reverse=True)})", "INFO")
         
         return best_quality
 
@@ -1068,34 +1068,40 @@ class YouTubeDownloaderApp:
                     audio_format = video_info['quality'].split('-')[1]  # 'default', 'best' or 'mp3'
                     if audio_format == 'default':
                         # Use default audio format (most compatible, fallback-friendly)
-                        ydl_opts['format'] = 'bestaudio/best'
-                        # No postprocessors - keep original format
+                        ydl_opts['format'] = 'ba/b'
+                        ydl_opts['postprocessors'] = [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': 'best',
+                            'preferredquality': '0'
+                        }]
                     elif audio_format == 'best':
                         # Use native audio format (no transcoding)
                         ydl_opts['format'] = 'ba[acodec^=aac]/ba[acodec^=mp4a.40.]/ba/b'
                         ydl_opts['postprocessors'] = [{
                             'key': 'FFmpegExtractAudio',
-                            'preferredcodec': 'best',
+                            'preferredcodec': 'aac',
                             'preferredquality': '0',
-                            'nopostoverwrites': False,
+                            'nopostoverwrites': False
                         }]
+                        ydl_opts['final_ext'] = 'aac'  # Save as aac
                     else:
                         # Use mp3 format (with transcoding)
-                        ydl_opts['format'] = 'bestaudio/best'
+                        ydl_opts['format'] = 'ba[acodec^=mp3]/ba/b'
                         ydl_opts['postprocessors'] = [{
                             'key': 'FFmpegExtractAudio', 
                             'preferredcodec': 'mp3', 
-                            'preferredquality': '192'
+                            'preferredquality': '192',
+                            'nopostoverwrites': False
                         }]
+                        ydl_opts['final_ext'] = 'mp3'  # Save as mp3
                 else:
+                    ydl_opts['format_sort'] = ['ext']  # Prefer mp4
                     quality = video_info['quality']
-                    if quality == 'Best':
-                        # Download best available quality without height restriction
-                        ydl_opts['format'] = 'bestvideo+bestaudio/best'
-                    else:
-                        height = quality[:-1]  # Remove 'p' from '1080p'
-                        ydl_opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]/best'
+                    if quality != 'Best':
+                        resolution = quality[:-1]  # Remove 'p' from '1080p'
+                        ydl_opts['format_sort'] += [f'res:{resolution}']
                     ydl_opts['merge_output_format'] = 'mp4'  # Ensure output is mp4
+                    ydl_opts['final_ext'] = 'mp4'  # Save as mp4
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     # Store reference for potential termination
