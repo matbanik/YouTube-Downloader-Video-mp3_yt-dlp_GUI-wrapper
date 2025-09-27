@@ -554,7 +554,11 @@ class YouTubeDownloaderApp:
             # Fix for YouTube SABR protocol issue (2025)
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'ios', 'tv']  # Workaround for YouTube's SABR; list for Python API and fallbacks
+                    'player_client': ['ios', 'android_creator', 'android_vr', 'android_music', 'android', 'tv'],
+                    'player_skip': ['webpage', 'configs'],
+                    'skip': ['hls', 'dash'],
+                    'include_hls_manifest': False,
+                    'include_dash_manifest': False,
                 }
             }
             # No playlistend limit - get all videos
