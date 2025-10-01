@@ -14,6 +14,88 @@ import webbrowser
 from queue import Queue
 import yt_dlp
 import logging
+import concurrent.futures
+from threading import Semaphore
+
+# --- yt-dlp Logger Class ---
+class YtDlpLogger:
+    """Custom logger for yt-dlp that integrates with the application's logging system."""
+    
+    def __init__(self, app_instance):
+        self.app = app_instance
+    
+    def debug(self, msg):
+        """Handle yt-dlp debug messages."""
+        self._queue_message(msg, "DEBUG")
+    
+    def info(self, msg):
+        """Handle yt-dlp info messages."""
+        self._queue_message(msg, "INFO")
+    
+    def warning(self, msg):
+        """Handle yt-dlp warning messages."""
+        self._queue_message(msg, "WARNING")
+        
+        # Check for SABR indicators in real-time
+        self._check_sabr_indicators(msg)
+    
+    def error(self, msg):
+        """Handle yt-dlp error messages."""
+        self._queue_message(msg, "ERROR")
+    
+    def _queue_message(self, msg, level):
+        """Queue a message for thread-safe processing on the GUI thread."""
+        try:
+            # Check for stop request during any yt-dlp operation - be very aggressive
+            if self.app.stop_event.is_set():
+                elapsed_time = time.time() - getattr(self.app, '_stop_start_time', time.time())
+                self.app.log_message(f"LOGGER: Stop detected during yt-dlp operation after {elapsed_time:.1f}s, raising cancellation", "WARNING")
+                raise yt_dlp.utils.DownloadCancelled('User requested stop during extraction')
+            
+            # Also check if we have a download cancellation flag
+            if hasattr(self.app, '_current_download_cancelled') and getattr(self.app, '_current_download_cancelled', False):
+                self.app.log_message("LOGGER: Download cancellation flag detected, raising cancellation", "WARNING")
+                raise yt_dlp.utils.DownloadCancelled('Download cancelled by monitor')
+            
+            message_data = {
+                'message': f"[yt-dlp] {msg}",
+                'level': level,
+                'timestamp': time.time()
+            }
+            self.app.message_queue.put_nowait(message_data)
+        except yt_dlp.utils.DownloadCancelled:
+            # Re-raise cancellation exceptions
+            raise
+        except Exception:
+            # If queue is full or there's an error, silently ignore to prevent blocking
+            pass
+    
+    def _check_sabr_indicators(self, msg):
+        """Check if a yt-dlp message indicates SABR restrictions."""
+        try:
+            msg_lower = msg.lower()
+            sabr_indicators = [
+                'require a gvs po token',
+                'android client https formats require a gvs po token',
+                'ios client https formats require a gvs po token',
+                'android client sabr formats require',
+                'ios client sabr formats require',
+                'sabr formats require a gvs po token'
+            ]
+            
+            for indicator in sabr_indicators:
+                if indicator in msg_lower:
+                    # SABR detected! Trigger detection if not already in SABR mode
+                    if not self.app.sabr_mode_active:
+                        print(f"SABR detected from yt-dlp warning: {indicator}")
+                        # Schedule SABR activation on main thread
+                        try:
+                            self.app.root.after(0, self.app.activate_sabr_from_warning, msg)
+                        except:
+                            pass  # Ignore if GUI not available
+                    break
+        except:
+            pass  # Ignore errors in SABR detection
 
 # --- Configuration ---
 SETTINGS_FILE = 'settings.json'
@@ -35,21 +117,60 @@ class YouTubeDownloaderApp:
         self.is_downloading = False
         self.stop_event = threading.Event()
         self.progress_queue = Queue()
+        self.message_queue = Queue()  # Queue for yt-dlp messages
         self.is_updating_from_selection = False # Flag to prevent update loops
         self.ydl_process = None  # Store yt-dlp process for stopping
         self.sort_column = None
         self.sort_reverse = False
         self.last_progress_time = 0  # Track last progress update time
         self.stop_message_logged = False  # Flag to prevent repeated stop messages
+        self._save_settings_after_id = None  # For delayed save operations
+        
+        # --- Caching Infrastructure ---
+        self.info_cache = {}  # Cache extracted info
+        self.extraction_locks = {}  # Prevent concurrent extractions of same URL
+        self.cache_expiry = {}  # Track cache expiration times
+        
+        # --- Batch Processing Infrastructure ---
+        self.extraction_semaphore = Semaphore(5)  # Limit concurrent extractions
+        
+        # --- SABR Bypass Mode Infrastructure ---
+        self.sabr_mode_active = False
+        self.sabr_detection_details = {}
+        self.last_sabr_check = None
+        self.sabr_indicator_frame = None
+        self.original_quality_options = ['Best', '2160p (4K)', '1440p (2K)', '1080p', '720p', '480p', '360p', '240p', '144p', 'Lowest']
+        self.original_audio_options = [
+            'default (Auto)', 
+            'best (Highest Quality)', 
+            'lowest (Smallest Size)',
+            'low_webm (~48kbps Opus)', 
+            'medium_webm (~70kbps Opus)', 
+            'standard_webm (~128kbps Opus)',
+            'standard_m4a (~128kbps AAC)', 
+            'standard_mp3 (~192kbps MP3)', 
+            'high_m4a (~160kbps AAC)'
+        ]
+        self.sabr_quality_options = ['360p']  # Only 360p works under SABR restrictions
+        self.sabr_audio_options = ['standard_mp3 (~192kbps MP3)', 'high_m4a (~160kbps AAC)']
 
         # --- GUI Variables ---
         self.download_path = tk.StringVar(value=DEFAULT_DOWNLOAD_PATH)
         self.log_level_var = tk.StringVar(value='INFO')
+        self.yt_dlp_debug_var = tk.BooleanVar(value=False)
+        self.console_visible_var = tk.BooleanVar(value=True)
+        
+        # --- yt-dlp Logger ---
+        self.yt_dlp_logger = YtDlpLogger(self)
 
         # --- GUI Setup ---
         self.setup_gui()
         self.load_settings()
         self.process_progress_queue()
+        self.process_message_queue()
+        
+        # Start periodic cache cleanup
+        self.root.after(300000, self.periodic_cleanup)  # Start cleanup after 5 minutes
 
     def setup_gui(self):
         """Creates and arranges all the GUI widgets."""
@@ -79,8 +200,8 @@ class YouTubeDownloaderApp:
         
         ttk.Label(options_frame, text="Quality:").pack(side=tk.LEFT, padx=(0, 5))
         self.quality_var = tk.StringVar(value='1080p')
-        quality_options = ['Best', '1080p', '720p', '480p', '360p']
-        self.quality_menu = ttk.OptionMenu(options_frame, self.quality_var, quality_options[1], *quality_options)  # Default to 1080p, not Best
+        quality_options = ['Best', '2160p (4K)', '1440p (2K)', '1080p', '720p', '480p', '360p', '240p', '144p', 'Lowest']
+        self.quality_menu = ttk.OptionMenu(options_frame, self.quality_var, quality_options[3], *quality_options)  # Default to 1080p
         self.quality_menu.pack(side=tk.LEFT, padx=(0, 20))
         
         self.audio_only_var = tk.BooleanVar()
@@ -89,10 +210,23 @@ class YouTubeDownloaderApp:
         
         # Audio format dropdown (initially hidden)
         self.audio_format_var = tk.StringVar(value='default')
-        self.audio_format_options = ['default (YouTube)', 'best (YouTube)', 'mp3 (FFmpeg)']
+        self.audio_format_options = [
+            'default (Auto)', 
+            'best (Highest Quality)', 
+            'lowest (Smallest Size)',
+            'low_webm (~48kbps Opus)', 
+            'medium_webm (~70kbps Opus)', 
+            'standard_webm (~128kbps Opus)',
+            'standard_m4a (~128kbps AAC)', 
+            'standard_mp3 (~192kbps MP3)', 
+            'high_m4a (~160kbps AAC)'
+        ]
         self.audio_format_menu = ttk.OptionMenu(options_frame, self.audio_format_var, self.audio_format_options[0], *self.audio_format_options)
         self.audio_format_menu.pack(side=tk.LEFT, padx=(5, 0))
         self.audio_format_menu.pack_forget()  # Hide initially
+        
+        # Info text about settings applying to selected and new items
+        ttk.Label(options_frame, text="Works on selected as well as on new", font=("Arial", 8), foreground="gray").pack(side=tk.LEFT, padx=(20, 0))
         
         # Check FFmpeg availability and update audio options
         self.check_ffmpeg_availability()
@@ -109,6 +243,69 @@ class YouTubeDownloaderApp:
         self.change_path_button = ttk.Button(path_frame, text="Change...", command=self.change_download_path)
         self.change_path_button.pack(side=tk.LEFT, padx=5)
 
+        # --- Control Buttons Frame ---
+        control_frame = ttk.Frame(top_frame)
+        control_frame.grid(row=3, column=0, columnspan=3, sticky='w', pady=5)
+        
+        # Start button with play icon (▶)
+        self.start_button = ttk.Button(control_frame, text="▶", command=self.start_download, width=3)
+        self.start_button.pack(side=tk.LEFT, padx=(0, 5))
+        
+        # Stop button with stop icon (⏹)
+        self.stop_button = ttk.Button(control_frame, text="⏹", command=self.stop_download, state=tk.DISABLED, width=3)
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Divider
+        ttk.Label(control_frame, text="|", foreground="gray").pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Move Up button with up arrow (↑)
+        self.move_up_button = ttk.Button(control_frame, text="↑", command=self.move_up, width=3)
+        self.move_up_button.pack(side=tk.LEFT, padx=(0, 5))
+        
+        # Move Down button with down arrow (↓)
+        self.move_down_button = ttk.Button(control_frame, text="↓", command=self.move_down, width=3)
+        self.move_down_button.pack(side=tk.LEFT, padx=(0, 5))
+        
+        # Add To Top button with underline and up arrow (⎺↑)
+        self.add_to_top_button = ttk.Button(control_frame, text="⎺↑", command=self.move_to_top, width=3)
+        self.add_to_top_button.pack(side=tk.LEFT, padx=(0, 5))
+        
+        # Add To Bottom button with overline and down arrow (⎽↓)
+        self.add_to_bottom_button = ttk.Button(control_frame, text="⎽↓", command=self.move_to_bottom, width=3)
+        self.add_to_bottom_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Divider
+        ttk.Label(control_frame, text="|", foreground="gray").pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Reset button with circular arrow (↻)
+        self.reset_button = ttk.Button(control_frame, text="↻", command=self.reset_selected, state=tk.DISABLED, width=3)
+        self.reset_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Divider
+        ttk.Label(control_frame, text="|", foreground="gray").pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Remove Selected button
+        self.remove_button = ttk.Button(control_frame, text="Remove Selected", command=self.remove_selected)
+        self.remove_button.pack(side=tk.LEFT, padx=(0, 5))
+        
+        # Clear All button
+        self.clear_all_button = ttk.Button(control_frame, text="Clear All", command=self.clear_all)
+        self.clear_all_button.pack(side=tk.LEFT)
+
+        # --- SABR Control Frame (new line under control buttons) ---
+        sabr_control_frame = ttk.Frame(top_frame)
+        sabr_control_frame.grid(row=4, column=0, columnspan=3, sticky='w', pady=5)
+        
+        # Manual SABR Check button
+        self.manual_sabr_button = ttk.Button(sabr_control_frame, text="Check SABR", command=self.manual_sabr_check)
+        self.manual_sabr_button.pack(side=tk.LEFT, padx=(0, 5))
+        
+        # Force SABR Mode button
+        self.force_sabr_button = ttk.Button(sabr_control_frame, text="Force SABR", command=self.force_sabr_mode)
+        self.force_sabr_button.pack(side=tk.LEFT, padx=(0, 5))
+        
+        # SABR indicator will be added here dynamically when active
+        self.sabr_control_frame = sabr_control_frame
 
         # --- List Frame: Download Queue ---
         # Status summary frame with colored labels (above the table)
@@ -140,78 +337,71 @@ class YouTubeDownloaderApp:
         self.downloading_label = tk.Label(status_summary_frame, text="Downloading: 0", font=("Arial", 9, "bold"), fg="blue")
         self.downloading_label.pack(side=tk.LEFT)
         
-        # Container for table and buttons
-        table_container = ttk.Frame(list_frame)
-        table_container.pack(fill=tk.BOTH, expand=True)
+        # Create a frame for the treeview with line numbers
+        tree_container = ttk.Frame(list_frame)
+        tree_container.pack(fill=tk.BOTH, expand=True)
         
-        # Create a frame for the treeview and scrollbar
-        tree_frame = ttk.Frame(table_container)
+        # Create frames for line numbers and treeview
+        left_line_frame = ttk.Frame(tree_container, width=40)
+        left_line_frame.pack(side=tk.LEFT, fill=tk.Y)
+        left_line_frame.pack_propagate(False)  # Maintain fixed width
+        
+        tree_frame = ttk.Frame(tree_container)
         tree_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        self.tree = ttk.Treeview(tree_frame, columns=('Name', 'ID', 'Quality', 'Duration', 'Status'), show='headings')
-        self.tree.heading('Name', text='Video Title', command=lambda: self.sort_treeview('Name'))
+        right_line_frame = ttk.Frame(tree_container, width=40)
+        right_line_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        right_line_frame.pack_propagate(False)  # Maintain fixed width
+        
+        # Create line number labels containers
+        self.left_line_labels = []
+        self.right_line_labels = []
+        
+        # Create scrollable frame for left line numbers
+        self.left_line_canvas = tk.Canvas(left_line_frame, width=40, bg='lightgray')
+        self.left_line_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # Create scrollable frame for right line numbers  
+        self.right_line_canvas = tk.Canvas(right_line_frame, width=40, bg='lightgray')
+        self.right_line_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        self.tree = ttk.Treeview(tree_frame, columns=('ID', 'Name', 'Quality', 'Duration', 'Status'), show='headings')
         self.tree.heading('ID', text='Video ID', command=lambda: self.sort_treeview('ID'))
+        self.tree.heading('Name', text='Video Title', command=lambda: self.sort_treeview('Name'))
         self.tree.heading('Quality', text='Format', command=lambda: self.sort_treeview('Quality'))
         self.tree.heading('Duration', text='Duration', command=lambda: self.sort_treeview('Duration'))
         self.tree.heading('Status', text='Status', command=lambda: self.sort_treeview('Status'))
-        self.tree.column('Name', width=300)
         self.tree.column('ID', width=120)
+        self.tree.column('Name', width=300)
         self.tree.column('Quality', width=100, anchor='center')
         self.tree.column('Duration', width=80, anchor='center')
         self.tree.column('Status', width=100, anchor='center')
         self.tree.bind('<<TreeviewSelect>>', self.on_video_select)
         self.tree.bind('<Button-1>', self.on_tree_click)  # Handle mouse clicks
         self.tree.bind('<Motion>', self.on_tree_motion)  # Handle mouse motion for cursor changes
+        self.tree.bind('<Enter>', self.on_tree_enter)  # Handle mouse enter
+        self.tree.bind('<Leave>', self.on_tree_leave)  # Handle mouse leave
         
         # Configure status colors
         self.setup_status_colors()
         
-        # Scrollbar for the treeview
-        tree_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscroll=tree_scrollbar.set)
+        # Scrollbar for the treeview with synchronized line numbers
+        tree_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.on_tree_scroll)
+        self.tree.configure(yscroll=self.on_tree_scrollbar_set)
         
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # --- List Control Buttons ---
-        list_button_frame = ttk.Frame(table_container)
-        list_button_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
 
-        self.remove_button = ttk.Button(list_button_frame, text="Remove", command=self.remove_selected)
-        self.remove_button.pack(pady=2, fill=tk.X)
-
-        self.clear_all_button = ttk.Button(list_button_frame, text="Clear All", command=self.clear_all)
-        self.clear_all_button.pack(pady=2, fill=tk.X)
-
-        # Separator
-        ttk.Separator(list_button_frame, orient='horizontal').pack(pady=5, fill=tk.X)
-
-        self.move_up_button = ttk.Button(list_button_frame, text="Move Up", command=self.move_up)
-        self.move_up_button.pack(pady=2, fill=tk.X)
-
-        self.move_down_button = ttk.Button(list_button_frame, text="Move Down", command=self.move_down)
-        self.move_down_button.pack(pady=2, fill=tk.X)
-
-        # Separator
-        ttk.Separator(list_button_frame, orient='horizontal').pack(pady=5, fill=tk.X)
-
-        self.start_button = ttk.Button(list_button_frame, text="Start", command=self.start_download)
-        self.start_button.pack(pady=2, fill=tk.X)
-
-        self.stop_button = ttk.Button(list_button_frame, text="Stop", command=self.stop_download, state=tk.DISABLED)
-        self.stop_button.pack(pady=2, fill=tk.X)
-
-        # Separator
-        ttk.Separator(list_button_frame, orient='horizontal').pack(pady=5, fill=tk.X)
-
-        self.reset_button = ttk.Button(list_button_frame, text="Reset", command=self.reset_selected, state=tk.DISABLED)
-        self.reset_button.pack(pady=2, fill=tk.X)
 
         # --- Console Frame: Progress Output ---
         console_header_frame = ttk.Frame(console_frame)
         console_header_frame.pack(fill=tk.X, pady=(0, 5))
         
-        ttk.Label(console_header_frame, text="Progress Log:").pack(side=tk.LEFT)
+        # Console visibility checkbox
+        self.console_check = ttk.Checkbutton(console_header_frame, text="Console", 
+                                           variable=self.console_visible_var, command=self.on_console_visibility_change)
+        self.console_check.pack(side=tk.LEFT)
         
         # Log level dropdown - moved to left side
         log_level_frame = ttk.Frame(console_header_frame)
@@ -222,13 +412,20 @@ class YouTubeDownloaderApp:
         self.log_level_menu = ttk.OptionMenu(log_level_frame, self.log_level_var, 'INFO', *log_levels, command=self.on_log_level_change)
         self.log_level_menu.pack(side=tk.LEFT)
         
+        # yt-dlp debug checkbox
+        self.yt_dlp_debug_check = ttk.Checkbutton(console_header_frame, text="Show yt-dlp debug output", 
+                                                  variable=self.yt_dlp_debug_var, command=self.on_yt_dlp_debug_change)
+        self.yt_dlp_debug_check.pack(side=tk.LEFT, padx=(20, 0))
+        
         # Check Dependencies button
         self.check_deps_button = ttk.Button(console_header_frame, text="Check Dependencies", command=self.check_dependencies)
         self.check_deps_button.pack(side=tk.LEFT, padx=(20, 0))
         
-        # Test Download button
-        self.test_download_button = ttk.Button(console_header_frame, text="Test Download", command=self.test_download)
-        self.test_download_button.pack(side=tk.LEFT, padx=(10, 0))
+        # Clear Logs button
+        self.clear_logs_button = ttk.Button(console_header_frame, text="Clear Logs", command=self.clear_logs)
+        self.clear_logs_button.pack(side=tk.LEFT, padx=(10, 0))
+        
+
         
         self.console = scrolledtext.ScrolledText(console_frame, height=14, state=tk.DISABLED, bg='black', fg='white', font=("Courier", 9))
         self.console.pack(fill=tk.X, expand=True)
@@ -244,6 +441,155 @@ class YouTubeDownloaderApp:
         self.tree.tag_configure('skipped', foreground='purple')
         self.tree.tag_configure('qualityblocked', foreground='orange')
         self.tree.tag_configure('agerestricted', foreground='brown')
+        self.tree.tag_configure('hover', background='lightgray')
+        self.tree.tag_configure('current_item', background='lightgreen')
+        
+        # Track current hover item
+        self.current_hover_item = None
+
+    def update_line_numbers(self):
+        """Updates line numbers and highlights currently downloading item."""
+        # Clear existing line numbers
+        self.left_line_canvas.delete("all")
+        self.right_line_canvas.delete("all")
+        
+        # Get all items in the treeview
+        all_items = self.tree.get_children()
+        
+        if not all_items:
+            # Handle empty queue state gracefully
+            self.left_line_canvas.configure(scrollregion=(0, 0, 0, 0))
+            self.right_line_canvas.configure(scrollregion=(0, 0, 0, 0))
+            return
+        
+        # Calculate proper row height and header offset
+        try:
+            # Get the actual row height from treeview
+            sample_bbox = self.tree.bbox(all_items[0])
+            if sample_bbox:
+                row_height = sample_bbox[3]  # Height of the row
+                header_height = sample_bbox[1]  # Y position of first row (header offset)
+            else:
+                row_height = 20  # Fallback height
+                header_height = 20  # Fallback header height
+        except:
+            row_height = 20  # Fallback height
+            header_height = 20  # Fallback header height
+        
+        # Find currently downloading item
+        downloading_item_index = -1
+        for i, item_id in enumerate(all_items):
+            current_values = self.tree.item(item_id, 'values')
+            if len(current_values) >= 5 and current_values[4] == '↓ Downloading':
+                downloading_item_index = i
+                break
+        
+        # If no item is downloading, highlight the first pending item
+        if downloading_item_index == -1:
+            for i, item_id in enumerate(all_items):
+                current_values = self.tree.item(item_id, 'values')
+                if len(current_values) >= 5 and current_values[4] == 'Pending':
+                    downloading_item_index = i
+                    break
+        
+        # Remove current_item tag from all items first
+        for item_id in all_items:
+            current_tags = list(self.tree.item(item_id, 'tags'))
+            if 'current_item' in current_tags:
+                current_tags.remove('current_item')
+                self.tree.item(item_id, tags=current_tags)
+        
+        # Create line numbers for each item
+        for i, item_id in enumerate(all_items):
+            line_num = i + 1
+            y_pos = header_height + (i * row_height) + (row_height // 2)  # Account for header and center in row
+            
+            # Check if this is the current/downloading item
+            is_current = (i == downloading_item_index)
+            
+            # Left line numbers
+            if is_current:
+                left_text = f"> {line_num}"
+                self.left_line_canvas.create_text(20, y_pos, text=left_text, anchor="center", 
+                                                fill="darkgreen", font=("Arial", 9, "bold"))
+            else:
+                self.left_line_canvas.create_text(20, y_pos, text=str(line_num), anchor="center", 
+                                                fill="gray", font=("Arial", 9))
+            
+            # Right line numbers  
+            if is_current:
+                right_text = f"{line_num} <"
+                self.right_line_canvas.create_text(20, y_pos, text=right_text, anchor="center", 
+                                                 fill="darkgreen", font=("Arial", 9, "bold"))
+            else:
+                self.right_line_canvas.create_text(20, y_pos, text=str(line_num), anchor="center", 
+                                                 fill="gray", font=("Arial", 9))
+        
+        # Update canvas scroll region to match the content height
+        total_height = header_height + (len(all_items) * row_height)
+        self.left_line_canvas.configure(scrollregion=(0, 0, 40, total_height))
+        self.right_line_canvas.configure(scrollregion=(0, 0, 40, total_height))
+        
+        # Highlight current item with light green background
+        if downloading_item_index >= 0 and downloading_item_index < len(all_items):
+            current_item = all_items[downloading_item_index]
+            current_tags = list(self.tree.item(current_item, 'tags'))
+            # Add current_item tag if not already present
+            if 'current_item' not in current_tags:
+                current_tags.append('current_item')
+                self.tree.item(current_item, tags=current_tags)
+
+    def on_tree_scroll(self, *args):
+        """Handle treeview scrolling and synchronize line numbers."""
+        self.tree.yview(*args)
+        # Synchronize line number canvases
+        self.left_line_canvas.yview(*args)
+        self.right_line_canvas.yview(*args)
+
+    def on_tree_scrollbar_set(self, first, last):
+        """Handle scrollbar updates and synchronize line numbers."""
+        # Update the scrollbar
+        tree_scrollbar = None
+        for child in self.tree.master.winfo_children():
+            if isinstance(child, ttk.Scrollbar):
+                tree_scrollbar = child
+                break
+        if tree_scrollbar:
+            tree_scrollbar.set(first, last)
+        
+        # Synchronize line number canvases
+        self.left_line_canvas.yview_moveto(first)
+        self.right_line_canvas.yview_moveto(first)
+
+    def format_video_id_with_icon(self, video_id):
+        """Format Video ID with link icon if it's clickable."""
+        if video_id and video_id != 'N/A' and self.is_valid_video_id(video_id):
+            return f"🔗 {video_id}"
+        else:
+            return video_id or 'N/A'
+    
+    def is_valid_video_id(self, video_id):
+        """Check if a Video ID appears to be valid for YouTube."""
+        if not video_id or video_id == 'N/A':
+            return False
+        # YouTube Video IDs are typically 11 characters long and contain alphanumeric characters, hyphens, and underscores
+        import re
+        return bool(re.match(r'^[a-zA-Z0-9_-]{11}$', video_id))
+    
+    def open_video_in_browser(self, video_id):
+        """Open a YouTube video in the default browser with enhanced error handling."""
+        if not video_id or video_id == 'N/A':
+            self.log_message("Cannot open video: Invalid Video ID", "WARNING")
+            return False
+        
+        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+        try:
+            webbrowser.open(youtube_url)
+            self.log_message(f"Opened YouTube video: {video_id}")
+            return True
+        except Exception as e:
+            self.log_message(f"Failed to open browser for video {video_id}: {e}", "ERROR")
+            return False
 
     def change_download_path(self):
         """Opens a dialog to choose a new download directory."""
@@ -251,7 +597,7 @@ class YouTubeDownloaderApp:
         if new_path:
             self.download_path.set(new_path)
             self.log_message(f"Download path set to: {new_path}")
-            self.save_settings()
+            self.schedule_save_settings()
 
     def on_video_select(self, event):
         """Updates quality controls when a video is selected in the list."""
@@ -276,13 +622,23 @@ class YouTubeDownloaderApp:
             quality = video_info['quality']
             if quality.startswith('Audio-'):
                 self.audio_only_var.set(True)
-                audio_format = quality.split('-')[1]  # Extract 'default', 'best' or 'mp3'
-                if audio_format == 'default':
-                    self.audio_format_var.set('default (YouTube)')
-                elif audio_format == 'best':
-                    self.audio_format_var.set('best (YouTube)')
-                else:
-                    self.audio_format_var.set('mp3 (FFmpeg)')
+                audio_format = quality.split('-')[1]  # Extract format key
+                
+                # Map format keys to display names
+                format_display_map = {
+                    'default': 'default (Auto)',
+                    'best': 'best (Highest Quality)',
+                    'lowest': 'lowest (Smallest Size)',
+                    'low_webm': 'low_webm (~48kbps Opus)',
+                    'medium_webm': 'medium_webm (~70kbps Opus)',
+                    'standard_webm': 'standard_webm (~128kbps Opus)',
+                    'standard_m4a': 'standard_m4a (~128kbps AAC)',
+                    'standard_mp3': 'standard_mp3 (~192kbps MP3)',
+                    'high_m4a': 'high_m4a (~160kbps AAC)'
+                }
+                
+                display_name = format_display_map.get(audio_format, 'default (Auto)')
+                self.audio_format_var.set(display_name)
                 self.audio_format_menu.pack(side=tk.LEFT, padx=(5, 0), after=self.audio_only_check)
                 self.quality_menu.config(state=tk.DISABLED)
             else:
@@ -304,41 +660,71 @@ class YouTubeDownloaderApp:
         if region == "cell":
             # Get the column that was clicked
             column = self.tree.identify_column(event.x)
-            # Column #2 is the Video ID column (columns are 1-indexed)
-            if column == '#2':
+            # Column #1 is the Video ID column (columns are 1-indexed)
+            if column == '#1':
                 # Get the item that was clicked
                 item = self.tree.identify_row(event.y)
                 if item:
                     # Get the video ID from the item
                     values = self.tree.item(item, 'values')
-                    if len(values) > 1:
-                        video_id = values[1]  # Video ID is at index 1
-                        if video_id and video_id != 'N/A':
-                            # Open YouTube URL in default browser
-                            youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-                            try:
-                                webbrowser.open(youtube_url)
-                                self.log_message(f"Opened YouTube video: {video_id}")
-                            except Exception as e:
-                                self.log_message(f"Failed to open browser: {e}", "ERROR")
+                    if len(values) > 0:
+                        video_id_display = values[0]  # Video ID display value (may have icon) - back to index 0
+                        # Only process clicks on items with the link icon (clickable Video IDs)
+                        if video_id_display and video_id_display.startswith('🔗 '):
+                            # Extract actual Video ID by removing the icon prefix
+                            video_id = video_id_display.replace('🔗 ', '')
+                            # Open video in browser using enhanced method
+                            self.open_video_in_browser(video_id)
 
     def on_tree_motion(self, event):
-        """Handle mouse motion over treeview to change cursor for Video ID column."""
+        """Handle mouse motion over treeview to change cursor for Video ID column and handle hover highlighting."""
+        # Handle hover highlighting
+        item = self.tree.identify_row(event.y)
+        if item and item != self.current_hover_item:
+            # Remove hover from previous item
+            if self.current_hover_item:
+                current_tags = list(self.tree.item(self.current_hover_item, 'tags'))
+                if 'hover' in current_tags:
+                    current_tags.remove('hover')
+                    self.tree.item(self.current_hover_item, tags=current_tags)
+            
+            # Add hover to new item
+            if item:
+                current_tags = list(self.tree.item(item, 'tags'))
+                if 'hover' not in current_tags:
+                    current_tags.append('hover')
+                    self.tree.item(item, tags=current_tags)
+                self.current_hover_item = item
+        
+        # Handle cursor changes for Video ID column
         region = self.tree.identify_region(event.x, event.y)
         if region == "cell":
             column = self.tree.identify_column(event.x)
-            # Column #2 is the Video ID column
-            if column == '#2':
-                item = self.tree.identify_row(event.y)
+            # Column #1 is the Video ID column
+            if column == '#1':
                 if item:
                     values = self.tree.item(item, 'values')
-                    if len(values) > 1 and values[1] and values[1] != 'N/A':
-                        # Change cursor to hand pointer
+                    if len(values) > 0 and values[0] and values[0].startswith('🔗 '):
+                        # Change cursor to hand pointer for clickable Video IDs (those with icons)
                         self.tree.config(cursor="hand2")
                         return
         
-        # Reset cursor to default
+        # Reset cursor to default for all other areas
         self.tree.config(cursor="")
+
+    def on_tree_enter(self, event):
+        """Handle mouse entering the treeview."""
+        pass  # Motion handler will take care of hover highlighting
+
+    def on_tree_leave(self, event):
+        """Handle mouse leaving the treeview."""
+        # Remove hover highlighting when mouse leaves
+        if self.current_hover_item:
+            current_tags = list(self.tree.item(self.current_hover_item, 'tags'))
+            if 'hover' in current_tags:
+                current_tags.remove('hover')
+                self.tree.item(self.current_hover_item, tags=current_tags)
+            self.current_hover_item = None
 
     def on_audio_only_change(self):
         """Handles audio only checkbox changes and shows/hides audio format dropdown."""
@@ -363,7 +749,9 @@ class YouTubeDownloaderApp:
 
         if self.audio_only_var.get():
             audio_format = self.audio_format_var.get()
-            new_quality = f'Audio-{audio_format.split()[0]}'  # 'Audio-default', 'Audio-best' or 'Audio-mp3'
+            # Extract the format key from the display name
+            format_key = audio_format.split()[0]  # Extract 'default', 'best', 'standard_mp3', etc.
+            new_quality = f'Audio-{format_key}'
         else:
             new_quality = self.quality_var.get()
 
@@ -380,12 +768,313 @@ class YouTubeDownloaderApp:
             self.tree.item(item_id, values=(current_values[0], current_values[1], new_quality, current_values[3] if len(current_values) > 3 else 'N/A', status))
         
         self.log_message(f"Updated settings for {len(selected_items)} selected item(s).")
-        self.save_settings()
+        self.schedule_save_settings()
 
     def on_log_level_change(self, selected_level):
         """Handles log level dropdown changes."""
         self.log_message(f"Log level changed to: {selected_level}")
-        self.save_settings()  # Save the new log level setting
+        self.schedule_save_settings()  # Save the new log level setting
+
+    def on_yt_dlp_debug_change(self):
+        """Handles yt-dlp debug checkbox changes."""
+        if self.yt_dlp_debug_var.get():
+            self.log_message("yt-dlp debug output enabled")
+        else:
+            self.log_message("yt-dlp debug output disabled")
+        self.schedule_save_settings()  # Save the new debug setting
+
+    def on_console_visibility_change(self):
+        """Handles console visibility checkbox changes."""
+        if self.console_visible_var.get():
+            self.console.pack(fill=tk.X, expand=True)
+            self.log_message("Console shown")
+        else:
+            self.console.pack_forget()
+        self.schedule_save_settings()  # Save the new console visibility setting
+
+    def clear_logs(self):
+        """Clears all messages from the console."""
+        self.console.config(state=tk.NORMAL)
+        self.console.delete(1.0, tk.END)
+        self.console.config(state=tk.DISABLED)
+        # Don't log a message about clearing logs since we just cleared them
+
+    def configure_ydl_opts_with_logger(self, ydl_opts):
+        """Configure ydl_opts with logger when debug is enabled."""
+        if self.yt_dlp_debug_var.get():
+            # Enable debug logging
+            ydl_opts['logger'] = self.yt_dlp_logger
+            ydl_opts['quiet'] = False
+            ydl_opts['no_warnings'] = False
+        else:
+            # Keep quiet mode when debug is disabled
+            ydl_opts['quiet'] = True
+            ydl_opts['no_warnings'] = True
+        
+        # Add common performance optimizations
+        ydl_opts.update({
+            'ignoreerrors': True,
+            'writeinfojson': False,
+            'writethumbnail': False,
+            'writesubtitles': False,
+            'writeautomaticsub': False,
+            'nocheckcertificate': True,
+            'prefer_insecure': False
+        })
+        
+        return ydl_opts
+
+    def build_extractor_args(self):
+        """Build unified extractor arguments for consistent YouTube handling."""
+        return {
+            'youtube': {
+                'player_client': ['android', 'tv', 'ios'],  # Stable order; android first
+                'player_skip': ['webpage', 'configs'],
+                'skip': ['hls', 'dash'],
+                'include_hls_manifest': False,
+                'include_dash_manifest': False
+            }
+        }
+
+    def get_audio_format_selector(self, quality_option, ffmpeg_available=True):
+        """Generate yt-dlp format selector based on audio quality choice with SABR-compatible fallbacks."""
+        # Progressive fallback strategy for audio formats due to SABR/PO Token restrictions
+        audio_format_map = {
+            'default': 'bestaudio/best[height<=480]/best',  # Fallback to low-res video if needed
+            'lowest': 'worstaudio/bestaudio/best[height<=360]/best',
+            'best': 'bestaudio/best[height<=720]/best',
+            'low_webm': 'bestaudio[ext=webm]/bestaudio/best[height<=360]/best',
+            'medium_webm': 'bestaudio[ext=webm]/bestaudio/best[height<=480]/best',
+            'standard_webm': 'bestaudio[ext=webm]/bestaudio/best[height<=480]/best',
+            'standard_m4a': 'bestaudio[ext=m4a]/bestaudio/best[height<=480]/best',
+            'standard_mp3': 'bestaudio/best[height<=480]/best',  # + FFmpeg postprocessor
+            'high_m4a': 'bestaudio[ext=m4a]/bestaudio/best[height<=720]/best'
+        }
+        
+        # Handle FFmpeg-dependent options
+        if quality_option == 'standard_mp3' and not ffmpeg_available:
+            self.log_message("MP3 format requires FFmpeg but it's not available. Using default audio format.", "WARNING")
+            return 'bestaudio/best[height<=480]/best'
+        
+        selected_format = audio_format_map.get(quality_option, 'bestaudio/best[height<=480]/best')
+        self.log_message(f"Audio format selector for '{quality_option}': {selected_format}", "DEBUG")
+        return selected_format
+
+    def get_video_format_selector(self, quality_option):
+        """Generate yt-dlp format selector based on video quality choice with SABR-compatible fallbacks."""
+        # Clean up quality option (remove extra info in parentheses)
+        clean_quality = quality_option.split()[0].lower()
+        
+        # SABR-compatible video format selectors with progressive fallbacks
+        video_format_map = {
+            'default': 'best[height<=720]/best[height<=480]/best',
+            'lowest': 'worst[height>=144]/worst[height>=240]/worst[height>=360]/worst',
+            'best': 'best[height<=1080]/best[height<=720]/best',
+            '144p': 'best[height<=144]/best[height<=240]/best[height<=360]/best',
+            '240p': 'best[height<=240]/best[height<=360]/best',
+            '360p': 'best[height<=360]/best[height<=480]/best',
+            '480p': 'best[height<=480]/best[height<=720]/best',
+            '720p': 'best[height<=720]/best[height<=1080]/best',
+            '1080p': 'best[height<=1080]/best[height<=720]/best',
+            '1440p': 'best[height<=1440]/best[height<=1080]/best',
+            '2160p': 'best[height<=2160]/best[height<=1440]/best',
+            '4320p': 'best[height<=4320]/best[height<=2160]/best'
+        }
+        
+        selected_format = video_format_map.get(clean_quality, 'best[height<=720]/best')
+        self.log_message(f"Video format selector for '{clean_quality}': {selected_format}", "DEBUG")
+        return selected_format
+
+    def get_optimal_format(self, formats, target_quality):
+        """Intelligently select the best format based on target quality."""
+        if not formats:
+            return None
+        
+        # Quality preference mapping
+        quality_map = {
+            'Best': float('inf'),
+            '1080p': 1080,
+            '720p': 720,
+            '480p': 480,
+            '360p': 360,
+            '240p': 240,
+            '144p': 144
+        }
+        
+        target_height = quality_map.get(target_quality, 720)
+        
+        def format_score(fmt):
+            height = fmt.get('height', 0)
+            vcodec = fmt.get('vcodec', '')
+            acodec = fmt.get('acodec', '')
+            
+            # Prefer formats with both video and audio
+            if vcodec == 'none' or acodec == 'none':
+                return -1
+            
+            # Prefer modern codecs
+            codec_bonus = 0
+            if 'av01' in vcodec:
+                codec_bonus = 100
+            elif 'vp9' in vcodec:
+                codec_bonus = 50
+            elif 'h264' in vcodec:
+                codec_bonus = 25
+            
+            # Calculate quality score
+            if target_height == float('inf'):
+                return height + codec_bonus
+            else:
+                if height <= target_height:
+                    return height + codec_bonus
+                else:
+                    return height - (height - target_height) * 2 + codec_bonus
+        
+        # Find best format
+        suitable_formats = [f for f in formats if format_score(f) >= 0]
+        if suitable_formats:
+            return max(suitable_formats, key=format_score)
+        
+        return formats[0] if formats else None
+
+    def optimize_format_selection(self, info_dict, quality):
+        """Optimize format selection process."""
+        formats = info_dict.get('formats', [])
+        
+        if not formats:
+            return None
+        
+        # For audio-only requests
+        if quality.startswith('Audio-'):
+            audio_formats = [f for f in formats if f.get('vcodec') == 'none']
+            if audio_formats:
+                return max(audio_formats, key=lambda x: x.get('abr', 0))
+        
+        # For video requests
+        return self.get_optimal_format(formats, quality)
+
+    def setup_postprocessors(self, quality_option):
+        """Setup FFmpeg postprocessors for format conversion - ALL audio formats get post-processors."""
+        postprocessors = []
+        
+        # Ensure ALL audio formats use post-processors to extract pure audio files
+        if quality_option == 'standard_mp3':
+            postprocessors.append({
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192'
+            })
+        elif quality_option == 'high_m4a':
+            postprocessors.append({
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'aac',
+                'preferredquality': '160'
+            })
+        else:
+            # For all other audio formats, extract audio to ensure pure audio files
+            # This prevents video files from being produced when audio is requested
+            postprocessors.append({
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'best',  # Let FFmpeg choose best available codec
+                'preferredquality': 'best'
+            })
+        
+        return postprocessors
+
+    def build_download_format(self, video_info):
+        """Build format and postprocessors configuration for a video using enhanced quality system."""
+        format_opts = {}
+        postprocessors = []
+        
+        if video_info['quality'].startswith('Audio-'):
+            # Enhanced audio quality handling with fallback strategy
+            audio_format = video_info['quality'].split('-')[1]  # Extract format type
+            self.log_message(f"Processing audio download: format='{audio_format}'", "DEBUG")
+            
+            # Check FFmpeg availability for format-dependent options
+            ffmpeg_available = self.check_ffmpeg_availability_status()
+            
+            # Get format selector using new fallback system
+            format_selector = self.get_audio_format_selector(audio_format, ffmpeg_available)
+            format_opts['format'] = format_selector
+            
+            # Add postprocessors if needed for audio extraction/conversion
+            postprocessors = self.setup_postprocessors(audio_format)
+            
+            # For MP3 conversion, add audio extraction options
+            if audio_format == 'standard_mp3' and ffmpeg_available:
+                postprocessors.append({
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192'
+                })
+            
+            self.log_message(f"Audio download config: format='{format_selector}', postprocessors={len(postprocessors)}", "DEBUG")
+            
+        else:
+            # Enhanced video quality handling with SABR-compatible fallbacks
+            quality = video_info['quality']
+            self.log_message(f"Processing video download: quality='{quality}'", "DEBUG")
+            
+            # Use new video format selector with progressive fallbacks
+            format_selector = self.get_video_format_selector(quality.lower())
+            format_opts['format'] = format_selector
+            format_opts['merge_output_format'] = 'mp4'  # Ensure output is mp4
+        
+        if postprocessors:
+            format_opts['postprocessors'] = postprocessors
+            
+        return format_opts
+
+    def build_ydl_opts(self, video_info=None, download_path=None, for_download=True):
+        """Build unified yt-dlp options for consistent behavior across all operations."""
+        # Base options that apply to all operations
+        base_opts = {
+            'retries': 5,
+            'fragment_retries': 5,
+            'extractor_retries': 5,
+            'socket_timeout': 10,  # Reduced for faster cancellation
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            },
+            'extractor_args': self.build_extractor_args()
+        }
+        
+        if for_download and download_path:
+            # Download-specific options
+            base_opts.update({
+                'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
+                'progress_hooks': [self.progress_hook],
+                'download_archive': os.path.join(download_path, 'download-archive.txt'),
+                'retry_sleep_functions': {'http': lambda n: min(4 ** n, 60)},
+                'http_chunk_size': 1048576,  # 1 MiB for faster cancellation
+                'concurrent_fragment_downloads': 3,
+                'keep_fragments': False,
+                'cleanup_fragments': True,
+                'noprogress': True,
+                'no_color': True,
+                'sleep_interval': 0.5,
+                'max_sleep_interval': 1,
+                'sleep_interval_requests': 0.5,
+                # Filename sanitization to prevent filesystem issues
+                'restrictfilenames': True,  # Remove problematic characters
+                'windowsfilenames': True,   # Windows-safe filenames
+            })
+            
+            # Add format-specific options if video_info provided
+            if video_info:
+                format_opts = self.build_download_format(video_info)
+                base_opts.update(format_opts)
+        else:
+            # Extraction-only options
+            base_opts.update({
+                'skip_download': True,
+            })
+        
+        # Apply logger configuration
+        base_opts = self.configure_ydl_opts_with_logger(base_opts)
+        
+        return base_opts
 
     def check_dependencies(self):
         """Check yt-dlp and FFmpeg versions manually when button is clicked."""
@@ -448,23 +1137,9 @@ class YouTubeDownloaderApp:
         # Refresh audio format options after dependency check
         self.check_ffmpeg_availability()
 
-    def test_download(self):
-        """Test download functionality with a short test video."""
-        test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Rick Roll - short, reliable test video
-        
-        self.log_message("Testing download functionality...", "INFO")
-        self.log_message(f"Test URL: {test_url}", "INFO")
-        
-        # Add the test URL to the queue
-        self.url_entry.delete(0, tk.END)
-        self.url_entry.insert(0, test_url)
-        
-        # Set to audio-only for faster test
-        self.audio_only_var.set(True)
-        self.audio_format_var.set('default (YouTube)')
-        
-        self.log_message("Added test video to queue. Click 'Start' to test download.", "INFO")
-        self.log_message("Note: This will download a short test video to verify functionality.", "INFO")
+
+
+
 
     def check_ffmpeg_availability(self):
         """Check if FFmpeg is available and update audio format options accordingly."""
@@ -478,9 +1153,18 @@ class YouTubeDownloaderApp:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
         
-        # FFmpeg not available, disable mp3 option
+        # FFmpeg not available, disable FFmpeg-dependent options
         self.ffmpeg_available = False
-        self.audio_format_options = ['default (YouTube)', 'best (YouTube)']
+        self.audio_format_options = [
+            'default (Auto)', 
+            'best (Highest Quality)', 
+            'lowest (Smallest Size)',
+            'low_webm (~48kbps Opus)', 
+            'medium_webm (~70kbps Opus)', 
+            'standard_webm (~128kbps Opus)',
+            'standard_m4a (~128kbps AAC)', 
+            'high_m4a (~160kbps AAC)'
+        ]
         
         # Update the menu
         menu = self.audio_format_menu['menu']
@@ -489,10 +1173,244 @@ class YouTubeDownloaderApp:
             menu.add_command(label=option, command=tk._setit(self.audio_format_var, option))
         
         # Reset to available option if currently set to unavailable one
-        if self.audio_format_var.get() == 'mp3 (FFmpeg)':
-            self.audio_format_var.set('default (YouTube)')
+        if 'mp3' in self.audio_format_var.get():
+            self.audio_format_var.set('default (Auto)')
             
         self.log_message("FFmpeg not detected. MP3 transcoding disabled. Using native audio formats only.", "INFO")
+
+    def check_ffmpeg_availability_status(self):
+        """Return current FFmpeg availability status."""
+        return getattr(self, 'ffmpeg_available', False)
+
+    def validate_downloaded_file(self, video_info):
+        """Validate that the downloaded file exists and determine actual format/codec."""
+        try:
+            download_path = self.download_path.get()
+            title = video_info['title']
+            
+            # Create multiple filename variations to check
+            filename_variations = []
+            
+            # 1. Original title (cleaned but with spaces)
+            clean_title = re.sub(r'[<>:"/\\|?*？！]', '', title)
+            clean_title = re.sub(r'[^\w\s\-_.,()[\]{}]', '', clean_title).strip()
+            filename_variations.append(clean_title)
+            
+            # 2. yt-dlp restricted filename (spaces -> underscores, special chars removed)
+            restricted_title = re.sub(r'[^\w\-_.]', '_', title)  # Replace non-alphanumeric with underscore
+            restricted_title = re.sub(r'_+', '_', restricted_title)  # Collapse multiple underscores
+            restricted_title = restricted_title.strip('_')  # Remove leading/trailing underscores
+            filename_variations.append(restricted_title)
+            
+            # 3. More aggressive cleaning (what yt-dlp might actually create)
+            aggressive_title = re.sub(r'[^\w\s]', '', title)  # Remove all special chars
+            aggressive_title = re.sub(r'\s+', '_', aggressive_title.strip())  # Spaces to underscores
+            filename_variations.append(aggressive_title)
+            
+            # Determine possible file extensions based on quality
+            if video_info['quality'].startswith('Audio-'):
+                audio_format = video_info['quality'].split('-')[1]
+                if audio_format == 'standard_mp3':
+                    possible_extensions = ['.mp3', '.m4a', '.webm', '.aac', '.ogg', '.opus']
+                else:
+                    possible_extensions = ['.webm', '.m4a', '.aac', '.mp3', '.ogg', '.opus']
+            else:
+                possible_extensions = ['.mp4', '.webm', '.mkv', '.avi']
+            
+            # Find the actual downloaded file by checking all variations
+            downloaded_file = None
+            self.log_message(f"Searching for downloaded file. Variations to check: {filename_variations}", "DEBUG")
+            
+            for filename in filename_variations:
+                for ext in possible_extensions:
+                    potential_file = os.path.join(download_path, f"{filename}{ext}")
+                    self.log_message(f"Checking: {potential_file}", "DEBUG")
+                    if os.path.exists(potential_file):
+                        downloaded_file = potential_file
+                        self.log_message(f"Found file: {os.path.basename(potential_file)}", "DEBUG")
+                        break
+                if downloaded_file:
+                    break
+            
+            if not downloaded_file:
+                # List actual files in download directory for debugging
+                try:
+                    actual_files = [f for f in os.listdir(download_path) if os.path.isfile(os.path.join(download_path, f))]
+                    self.log_message(f"Download path being checked: {download_path}", "DEBUG")
+                    self.log_message(f"Files actually in download directory: {actual_files[:10]}", "DEBUG")  # Show first 10
+                    
+                    # Look for any video/audio files that might match
+                    video_audio_files = [f for f in actual_files if f.lower().endswith(('.mp4', '.webm', '.m4a', '.mp3', '.aac', '.ogg', '.opus'))]
+                    if video_audio_files:
+                        self.log_message(f"Video/audio files found: {video_audio_files}", "DEBUG")
+                        
+                        # Try to find a close match using fuzzy matching
+                        title_words = set(video_info['title'].lower().split())
+                        best_match = None
+                        best_score = 0
+                        
+                        for file in video_audio_files:
+                            # Remove extension for comparison
+                            file_base = os.path.splitext(file)[0]
+                            file_words = set(file_base.lower().replace('_', ' ').replace('-', ' ').split())
+                            common_words = title_words.intersection(file_words)
+                            score = len(common_words)
+                            
+                            # Also check if the file contains key parts of the title
+                            title_clean = re.sub(r'[^\w\s]', '', video_info['title'].lower())
+                            file_clean = re.sub(r'[^\w\s]', '', file_base.lower())
+                            
+                            # Check for substring matches
+                            if title_clean in file_clean or file_clean in title_clean:
+                                score += 5  # Bonus for substring match
+                            
+                            if score > best_score and score >= 1:  # At least 1 word match or substring
+                                best_match = file
+                                best_score = score
+                        
+                        if best_match:
+                            potential_match = os.path.join(download_path, best_match)
+                            self.log_message(f"Best match found: {best_match} (score: {best_score})", "DEBUG")
+                            downloaded_file = potential_match
+                    
+                except Exception as e:
+                    self.log_message(f"Could not list download directory: {e}", "DEBUG")
+            
+            if not downloaded_file:
+                return {
+                    'success': False,
+                    'error': f"Downloaded file not found. Expected in: {download_path}",
+                    'actual_format': video_info['quality']
+                }
+            
+            # Get file info and determine actual format
+            file_size = os.path.getsize(downloaded_file)
+            if file_size == 0:
+                return {
+                    'success': False,
+                    'error': "Downloaded file is empty (0 bytes)",
+                    'actual_format': video_info['quality']
+                }
+            
+            # Determine actual format based on file extension and content
+            actual_format = self.analyze_file_format(downloaded_file, video_info)
+            
+            self.log_message(f"File validation successful: {os.path.basename(downloaded_file)} ({file_size:,} bytes)", "DEBUG")
+            
+            return {
+                'success': True,
+                'actual_format': actual_format,
+                'file_path': downloaded_file,
+                'file_size': file_size
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'error': f"File validation error: {str(e)}",
+                'actual_format': video_info['quality']
+            }
+
+    def analyze_file_format(self, file_path, video_info):
+        """Analyze the downloaded file to determine actual format/codec."""
+        try:
+            file_ext = os.path.splitext(file_path)[1].lower()
+            
+            if video_info['quality'].startswith('Audio-'):
+                # For audio files, try to determine codec and bitrate
+                return self.analyze_audio_format(file_path, file_ext)
+            else:
+                # For video files, try to determine resolution and codec
+                return self.analyze_video_format(file_path, file_ext, video_info)
+                
+        except Exception as e:
+            self.log_message(f"Format analysis failed: {e}", "DEBUG")
+            # Fallback to basic format based on extension
+            if video_info['quality'].startswith('Audio-'):
+                return f"Audio {file_ext.upper()}"
+            else:
+                return f"Video {file_ext.upper()}"
+
+    def analyze_audio_format(self, file_path, file_ext):
+        """Analyze audio file to determine codec and bitrate."""
+        try:
+            # Try to use FFprobe if available for detailed analysis
+            if self.check_ffmpeg_availability_status():
+                result = subprocess.run([
+                    'ffprobe', '-v', 'quiet', '-print_format', 'json', 
+                    '-show_format', '-show_streams', file_path
+                ], capture_output=True, text=True, timeout=10)
+                
+                if result.returncode == 0:
+                    import json
+                    data = json.loads(result.stdout)
+                    
+                    for stream in data.get('streams', []):
+                        if stream.get('codec_type') == 'audio':
+                            codec = stream.get('codec_name', 'unknown')
+                            bitrate = stream.get('bit_rate')
+                            
+                            if bitrate:
+                                bitrate_kbps = int(bitrate) // 1000
+                                return f"{bitrate_kbps}kbps {codec.upper()}"
+                            else:
+                                return f"{codec.upper()} Audio"
+            
+            # Fallback based on file extension
+            ext_map = {
+                '.mp3': 'MP3 Audio',
+                '.m4a': 'AAC Audio', 
+                '.aac': 'AAC Audio',
+                '.webm': 'Opus Audio',
+                '.ogg': 'Vorbis Audio',
+                '.opus': 'Opus Audio'
+            }
+            
+            return ext_map.get(file_ext, f"Audio {file_ext.upper()}")
+            
+        except Exception as e:
+            self.log_message(f"Audio analysis failed: {e}", "DEBUG")
+            return f"Audio {file_ext.upper()}"
+
+    def analyze_video_format(self, file_path, file_ext, video_info):
+        """Analyze video file to determine resolution and codec."""
+        try:
+            # Try to use FFprobe if available for detailed analysis
+            if self.check_ffmpeg_availability_status():
+                result = subprocess.run([
+                    'ffprobe', '-v', 'quiet', '-print_format', 'json', 
+                    '-show_format', '-show_streams', file_path
+                ], capture_output=True, text=True, timeout=10)
+                
+                if result.returncode == 0:
+                    import json
+                    data = json.loads(result.stdout)
+                    
+                    for stream in data.get('streams', []):
+                        if stream.get('codec_type') == 'video':
+                            width = stream.get('width')
+                            height = stream.get('height')
+                            codec = stream.get('codec_name', 'unknown')
+                            
+                            if height:
+                                # Map original quality to actual downloaded quality
+                                original_quality = video_info['quality']
+                                if original_quality in ['Best', 'Lowest']:
+                                    return f"{original_quality} → {height}p"
+                                else:
+                                    return f"{height}p"
+                            else:
+                                return f"{codec.upper()} Video"
+            
+            # Fallback - if we can't analyze, show what was requested vs adjusted
+            if hasattr(video_info, 'adjusted_quality') and video_info.get('adjusted_quality'):
+                return video_info['adjusted_quality']
+            else:
+                return video_info['quality']
+                
+        except Exception as e:
+            self.log_message(f"Video analysis failed: {e}", "DEBUG")
+            return video_info['quality']
 
     def validate_url(self, url):
         """Validate if the URL is a supported YouTube URL."""
@@ -526,43 +1444,192 @@ class YouTubeDownloaderApp:
 
         if self.audio_only_var.get():
             audio_format = self.audio_format_var.get()
-            quality = f'Audio-{audio_format.split()[0]}'  # 'Audio-default', 'Audio-best' or 'Audio-mp3'
+            # Extract the format key from the display name
+            format_key = audio_format.split()[0]  # Extract 'default', 'best', 'standard_mp3', etc.
+            quality = f'Audio-{format_key}'
         else:
             quality = self.quality_var.get()
         self.url_entry.delete(0, tk.END)
         self.log_message(f"Processing URL: {url}")
         self.log_message("Processing URL... (This may take a moment for playlists)")
-        threading.Thread(target=self._process_url, args=(url, quality), daemon=True).start()
+        threading.Thread(target=self._process_url_with_cache, args=(url, quality), daemon=True).start()
+
+    def _process_url_with_cache(self, url, quality):
+        """Process URL with caching to prevent multiple extractions."""
+        cache_key = f"{url}_{quality}"
+        
+        # Check if cached and not expired
+        if cache_key in self.info_cache:
+            if self._is_cache_valid(cache_key):
+                self.log_message(f"Using cached info for: {url}", "DEBUG")
+                videos_to_add = self.info_cache[cache_key]
+                if videos_to_add:
+                    # Only log for significant batch sizes to reduce spam
+                    if len(videos_to_add) > 5:
+                        self.log_message(f"Adding {len(videos_to_add)} cached videos to GUI", "DEBUG")
+                    self.root.after(0, self.add_videos_to_gui, videos_to_add)
+                return
+            else:
+                # Remove expired cache
+                del self.info_cache[cache_key]
+                del self.cache_expiry[cache_key]
+        
+        # Prevent concurrent extraction of same URL
+        if cache_key in self.extraction_locks:
+            self.log_message(f"Extraction already in progress for: {url}", "DEBUG")
+            return
+        
+        self.extraction_locks[cache_key] = True
+        try:
+            videos_to_add = self._extract_info(url, quality)
+            if videos_to_add:  # Only cache successful results
+                self.info_cache[cache_key] = videos_to_add
+                self.cache_expiry[cache_key] = time.time() + 300  # 5 minute cache
+                
+                # Only log for significant batch sizes to reduce spam
+                if len(videos_to_add) > 5:
+                    self.log_message(f"Adding {len(videos_to_add)} videos to GUI", "DEBUG")
+                self.root.after(0, self.add_videos_to_gui, videos_to_add)
+        except Exception as e:
+            self.log_message(f"Error in cached URL processing: {e}", "ERROR")
+        finally:
+            if cache_key in self.extraction_locks:
+                del self.extraction_locks[cache_key]
+
+    def _is_cache_valid(self, cache_key):
+        """Check if cached data is still valid."""
+        return (cache_key in self.cache_expiry and 
+                time.time() < self.cache_expiry[cache_key])
+
+    def cleanup_cache(self):
+        """Clean up expired cache entries and limit memory usage."""
+        current_time = time.time()
+        expired_keys = [
+            key for key, expiry_time in self.cache_expiry.items()
+            if current_time > expiry_time
+        ]
+        
+        for key in expired_keys:
+            if key in self.info_cache:
+                del self.info_cache[key]
+            if key in self.cache_expiry:
+                del self.cache_expiry[key]
+        
+        # Limit cache size (keep only most recent 1000 entries)
+        if len(self.info_cache) > 1000:
+            sorted_keys = sorted(
+                self.cache_expiry.items(), 
+                key=lambda x: x[1]
+            )
+            keys_to_remove = [key for key, _ in sorted_keys[:-1000]]
+            
+            for key in keys_to_remove:
+                if key in self.info_cache:
+                    del self.info_cache[key]
+                if key in self.cache_expiry:
+                    del self.cache_expiry[key]
+
+    def periodic_cleanup(self):
+        """Periodically clean up cache and resources."""
+        self.cleanup_cache()
+        self.root.after(300000, self.periodic_cleanup)  # Every 5 minutes
+
+    def _extract_info(self, url, quality):
+        """Extract info from URL (actual extraction logic)."""
+        # This method contains the actual extraction logic from _process_url
+        # but returns the result instead of updating GUI directly
+        
+        # Use unified options builder for extraction
+        ydl_opts = self.build_ydl_opts(for_download=False)
+        ydl_opts['extract_flat'] = 'in_playlist'  # Extract flat for playlists/channels
+        
+        try:
+            self.log_message("Extracting video information...", "DEBUG")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            
+            self.log_message("Extraction completed", "DEBUG")
+            
+            if not info:
+                self.log_message("No information extracted from URL", "ERROR")
+                return None
+            
+            videos_to_add = []
+            
+            if 'entries' in info:  # Playlist or channel
+                all_entries = info['entries']
+                valid_entries = [e for e in all_entries if e and e.get('id')]
+                total_entries = len(valid_entries)
+                
+                self.log_message(f"Found {total_entries} videos in playlist/channel")
+                
+                # Use batch processing for large playlists (>20 items)
+                if total_entries > 20:
+                    self.log_message("Using batch processing for large playlist...")
+                    videos_to_add = self._process_playlist_batch(valid_entries, quality)
+                else:
+                    # Keep sequential processing for small playlists to avoid overhead
+                    for i, entry in enumerate(valid_entries):
+                        video_url = f"https://www.youtube.com/watch?v={entry.get('id')}"
+                        videos_to_add.append({
+                            'title': entry.get('title', 'N/A'), 
+                            'id': entry.get('id', 'N/A'), 
+                            'url': video_url, 
+                            'quality': quality,
+                            'duration': self.format_duration(entry.get('duration'))
+                        })
+                        
+                        # Update progress every 10 videos for small playlists
+                        if (i + 1) % 10 == 0:
+                            progress_msg = f"Processed {i + 1}/{total_entries} videos..."
+                            self.log_message(progress_msg)
+                
+                self.log_message(f"Successfully processed all {len(videos_to_add)} videos from playlist/channel")
+                
+            else:  # Single video
+                self.log_message("Processing single video", "DEBUG")
+                # Use unified options builder for single video extraction
+                ydl_opts_full = self.build_ydl_opts(for_download=False)
+                ydl_opts_full['extract_flat'] = False  # Full extraction for single videos
+                
+                with yt_dlp.YoutubeDL(ydl_opts_full) as ydl_full:
+                    full_info = ydl_full.extract_info(url, download=False)
+                
+                if full_info:
+                    duration = self.format_duration(full_info.get('duration'))
+                    
+                    # Auto-adjust quality for single video
+                    adjusted_quality = quality
+                    if not quality.startswith('Audio-'):
+                        adjusted_quality = self.check_and_adjust_single_video_quality(full_info, quality)
+                    
+                    videos_to_add.append({
+                        'title': full_info.get('title', 'N/A'), 
+                        'id': full_info.get('id', 'N/A'), 
+                        'url': full_info.get('webpage_url', url), 
+                        'quality': adjusted_quality,
+                        'duration': duration,
+                        'info': full_info  # Store complete info object
+                    })
+                    self.log_message(f"Added video: {full_info.get('title')}")
+            
+            return videos_to_add
+            
+        except Exception as e:
+            self.log_message(f"Error fetching video info: {e}", "ERROR")
+            return None
 
     def _process_url(self, url, quality):
         """Worker function to fetch video info without blocking the GUI."""
         self.log_message(f"Starting to process URL: {url}", "DEBUG")
         
+        # Use the extraction logic and handle GUI updates
+        videos_to_add = self._extract_info(url, quality)
+        
         # Use extract_flat for initial processing to avoid hanging
-        ydl_opts = {
-            'quiet': True, 
-            'extract_flat': 'in_playlist',  # Extract flat for playlists/channels
-            'skip_download': True,
-            'ignoreerrors': True,
-            # Enhanced options for better reliability
-            'retries': 3,
-            'socket_timeout': 30,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            },
-            'nocheckcertificate': True,
-            # Fix for YouTube SABR protocol issue (2025)
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['ios', 'android_creator', 'android_vr', 'android_music', 'android', 'tv'],
-                    'player_skip': ['webpage', 'configs'],
-                    'skip': ['hls', 'dash'],
-                    'include_hls_manifest': False,
-                    'include_dash_manifest': False,
-                }
-            }
-            # No playlistend limit - get all videos
-        }
+        # Use unified options builder for extraction
+        ydl_opts = self.build_ydl_opts(for_download=False)
+        ydl_opts['extract_flat'] = 'in_playlist'  # Extract flat for playlists/channels
         
         try:
             self.log_message("Extracting video information...", "DEBUG")
@@ -588,42 +1655,41 @@ class YouTubeDownloaderApp:
                 total_entries = len(valid_entries)
                 
                 self.log_message(f"Found {total_entries} videos in playlist/channel")
-                self.log_message("Processing videos... This may take a while for large channels", "INFO")
                 
-                for i, entry in enumerate(valid_entries):
-                    # For flat extraction, we get basic info
-                    video_url = f"https://www.youtube.com/watch?v={entry.get('id')}"
-                    videos_to_add.append({
-                        'title': entry.get('title', 'N/A'), 
-                        'id': entry.get('id', 'N/A'), 
-                        'url': video_url, 
-                        'quality': quality,
-                        'duration': self.format_duration(entry.get('duration'))
-                    })
+                # Use batch processing for large playlists (>20 items)
+                if total_entries > 20:
+                    self.log_message("Using batch processing for large playlist... This will be faster!", "INFO")
+                    videos_to_add = self._process_playlist_batch(valid_entries, quality)
+                else:
+                    # Keep sequential processing for small playlists to avoid overhead
+                    self.log_message("Processing videos... This may take a while for large channels", "INFO")
                     
-                    # Update progress every 25 videos and show in console
-                    if (i + 1) % 25 == 0:
-                        progress_msg = f"Processed {i + 1}/{total_entries} videos..."
-                        self.log_message(progress_msg)
-                        # Also update GUI immediately for user feedback
-                        self.root.after(0, lambda msg=progress_msg: self.log_message(msg, overwrite=True))
+                    for i, entry in enumerate(valid_entries):
+                        # For flat extraction, we get basic info
+                        video_url = f"https://www.youtube.com/watch?v={entry.get('id')}"
+                        videos_to_add.append({
+                            'title': entry.get('title', 'N/A'), 
+                            'id': entry.get('id', 'N/A'), 
+                            'url': video_url, 
+                            'quality': quality,
+                            'duration': self.format_duration(entry.get('duration'))
+                        })
+                        
+                        # Update progress every 10 videos for small playlists and show in console
+                        if (i + 1) % 10 == 0:
+                            progress_msg = f"Processed {i + 1}/{total_entries} videos..."
+                            self.log_message(progress_msg)
+                            # Also update GUI immediately for user feedback
+                            self.root.after(0, lambda msg=progress_msg: self.log_message(msg, overwrite=True))
                 
                 self.log_message(f"Successfully processed all {len(videos_to_add)} videos from playlist/channel")
                 
             else: # Single video - need full extraction
                 self.log_message("Processing single video", "DEBUG")
                 # For single videos, do a full extraction to get duration
-                ydl_opts_full = {
-                    'quiet': True, 
-                    'extract_flat': False, 
-                    'skip_download': True,
-                    # Use non-web client(s) to avoid SABR-only responses
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': ['android', 'ios', 'tv']
-                        }
-                    }
-                }
+                # Use unified options builder for single video extraction
+                ydl_opts_full = self.build_ydl_opts(for_download=False)
+                ydl_opts_full['extract_flat'] = False  # Full extraction for single videos
                 
                 with yt_dlp.YoutubeDL(ydl_opts_full) as ydl_full:
                     full_info = ydl_full.extract_info(url, download=False)
@@ -654,7 +1720,9 @@ class YouTubeDownloaderApp:
                 elif len(videos_to_add) > 1:
                     self.log_message(f"Quality will be auto-adjusted during download for {len(videos_to_add)} videos", "INFO")
                 
-                self.log_message(f"Adding {len(videos_to_add)} videos to GUI", "DEBUG")
+                # Only log for significant batch sizes to reduce spam
+                if len(videos_to_add) > 5:
+                    self.log_message(f"Adding {len(videos_to_add)} videos to GUI", "DEBUG")
                 self.root.after(0, self.add_videos_to_gui, videos_to_add)
             else:
                 self.log_message("No videos were extracted from the URL", "WARNING")
@@ -663,6 +1731,64 @@ class YouTubeDownloaderApp:
             self.log_message(f"Error fetching video info: {e}", "ERROR")
             import traceback
             self.log_message(f"Traceback: {traceback.format_exc()}", "DEBUG")
+
+    def _process_playlist_batch(self, entries, quality, batch_size=10):
+        """Process playlist entries in batches for better performance."""
+        videos_to_add = []
+        
+        # Process in batches
+        for i in range(0, len(entries), batch_size):
+            batch = entries[i:i + batch_size]
+            batch_results = self._extract_batch_metadata(batch, quality)
+            videos_to_add.extend(batch_results)
+            
+            # Update progress
+            progress = min(i + batch_size, len(entries))
+            self.log_message(f"Processed {progress}/{len(entries)} videos...")
+            
+        return videos_to_add
+
+    def _extract_batch_metadata(self, entries, quality):
+        """Extract metadata for a batch of entries concurrently."""
+        results = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # Submit all tasks
+            future_to_entry = {
+                executor.submit(self._extract_single_entry, entry, quality): entry 
+                for entry in entries
+            }
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_entry):
+                entry = future_to_entry[future]
+                try:
+                    result = future.result(timeout=30)
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    self.log_message(f"Failed to process {entry.get('id', 'unknown')}: {e}", "WARNING")
+        
+        return results
+
+    def _extract_single_entry(self, entry, quality):
+        """Extract metadata for a single entry with rate limiting."""
+        with self.extraction_semaphore:
+            try:
+                # Add small delay to avoid rate limiting
+                time.sleep(0.1)
+                
+                video_url = f"https://www.youtube.com/watch?v={entry.get('id')}"
+                return {
+                    'title': entry.get('title', 'N/A'),
+                    'id': entry.get('id', 'N/A'),
+                    'url': video_url,
+                    'quality': quality,
+                    'duration': self.format_duration(entry.get('duration'))
+                }
+            except Exception as e:
+                self.log_message(f"Error processing entry: {e}", "DEBUG")
+                return None
 
     def auto_adjust_quality(self, videos_to_add, requested_quality):
         """Auto-adjust video quality based on available formats."""
@@ -682,7 +1808,6 @@ class YouTubeDownloaderApp:
             try:
                 # Get available formats for this video
                 ydl_opts = {
-                    'quiet': True,
                     'skip_download': True,
                     'listformats': False,
                     # Use non-web client(s) to avoid SABR-only responses
@@ -692,6 +1817,9 @@ class YouTubeDownloaderApp:
                         }
                     }
                 }
+                
+                # Configure logger and quiet settings
+                ydl_opts = self.configure_ydl_opts_with_logger(ydl_opts)
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(video['url'], download=False)
@@ -743,11 +1871,14 @@ class YouTubeDownloaderApp:
                     video['quality'] = best_quality
                 else:
                     # If we can't get format info, keep original quality
-                    self.log_message(f"Could not check formats for '{video['title'][:50]}...', keeping {requested_quality}", "DEBUG")
+                    # Reduce logging verbosity for format checks
+                    pass  # Keep original quality silently
                     
             except Exception as e:
                 # If quality check fails, keep original quality
-                self.log_message(f"Quality check failed for '{video['title'][:50]}...': {e}", "DEBUG")
+                # Only log quality check failures for non-network errors
+                if "network" not in str(e).lower() and "timeout" not in str(e).lower():
+                    self.log_message(f"Quality check failed for '{video['title'][:50]}...': {e}", "DEBUG")
                 
             adjusted_videos.append(video)
         
@@ -814,6 +1945,8 @@ class YouTubeDownloaderApp:
         # Only log adjustment if it actually changed and it's a significant change
         if best_quality != requested_quality:
             self.log_message(f"Quality auto-adjusted: '{video_info.get('title', 'Unknown')[:50]}...' {requested_quality} → {best_quality} (available: {sorted(available_heights, reverse=True)})", "INFO")
+            # Store the adjusted quality for later GUI update
+            video_info['adjusted_quality'] = best_quality
         
         return best_quality
 
@@ -824,16 +1957,8 @@ class YouTubeDownloaderApp:
             return video_info['quality']
             
         try:
-            ydl_opts = {
-                'quiet': True,
-                'skip_download': True,
-                # Use non-web client(s) to avoid SABR-only responses
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android', 'ios', 'tv']
-                    }
-                }
-            }
+            # Use unified options builder for quality checking
+            ydl_opts = self.build_ydl_opts(for_download=False)
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(video_info['url'], download=False)
@@ -852,7 +1977,7 @@ class YouTubeDownloaderApp:
             
         current_values = list(self.tree.item(item_id, 'values'))
         if len(current_values) >= 3:
-            current_values[2] = new_quality  # Quality is at index 2
+            current_values[2] = new_quality  # Quality is back to index 2
             self.tree.item(item_id, values=current_values)
 
     def format_duration(self, duration_seconds):
@@ -875,27 +2000,37 @@ class YouTubeDownloaderApp:
 
     def add_videos_to_gui(self, videos):
         """Adds video information to the Treeview and internal queue."""
+        # Check for duplicates
+        existing_ids = {video.get('id') for video in self.download_queue}
+        new_videos = []
+        duplicate_count = 0
+        
         for video in videos:
-            duration = video.get('duration', 'N/A')
-            status = video.get('status', 'Pending')  # Use existing status or default to Pending
-            item_id = self.tree.insert('', tk.END, values=(video['title'], video['id'], video['quality'], duration, status), tags=('pending',))
-            video['item_id'] = item_id
-            video['status'] = status
-            self.download_queue.append(video)
-            
-            # Set appropriate color tag based on status
-            if status == 'Downloading':
-                self.tree.item(item_id, tags=('downloading',))
-            elif status == 'Done':
-                self.tree.item(item_id, tags=('done',))
-            elif status == 'Failed':
-                self.tree.item(item_id, tags=('failed',))
-            elif status == 'Skipped':
-                self.tree.item(item_id, tags=('skipped',))
+            if video.get('id') not in existing_ids:
+                new_videos.append(video)
+                existing_ids.add(video.get('id'))  # Add to set to prevent duplicates within this batch
             else:
-                self.tree.item(item_id, tags=('pending',))
-        self.update_status_summary()  # Update status summary after adding videos
-        self.save_settings()
+                duplicate_count += 1
+        
+        if duplicate_count > 0:
+            self.log_message(f"Skipped {duplicate_count} duplicate video(s) that were already in the queue", "INFO")
+        
+        if new_videos:
+            self.log_message(f"Adding {len(new_videos)} new video(s) to queue", "INFO")
+            self._insert_videos_chunked(list(new_videos))
+            
+            # Trigger SABR detection if not in SABR mode and haven't checked recently
+            should_check_sabr = (
+                not self.sabr_mode_active and 
+                (self.last_sabr_check is None or 
+                 (time.time() - self.last_sabr_check) > 3600)  # Check every hour
+            )
+            
+            if should_check_sabr:
+                self.log_message("Triggering SABR detection for new URL...", "DEBUG")
+                self.trigger_sabr_detection(new_videos[0].get('url', ''))
+        else:
+            self.log_message("No new videos to add - all videos were already in the queue", "INFO")
 
     def remove_selected(self):
         """Removes the selected video from the queue."""
@@ -910,7 +2045,8 @@ class YouTubeDownloaderApp:
         self.log_message(f"Removed {len(selected_items)} item(s) from the queue.")
         self.update_reset_button_state()  # Update reset button after removal
         self.update_status_summary()  # Update status summary after removal
-        self.save_settings()
+        self.update_line_numbers()  # Update line numbers after removal
+        self.schedule_save_settings()
 
     def clear_all(self):
         """Clears all items from the download queue."""
@@ -928,7 +2064,8 @@ class YouTubeDownloaderApp:
             self.log_message("Cleared all items from the queue.")
             self.update_reset_button_state()  # Update reset button after clearing
             self.update_status_summary()  # Update status summary after clearing
-            self.save_settings()
+            self.update_line_numbers()  # Update line numbers after clearing
+            self.schedule_save_settings()
 
     def move_up(self):
         """Moves selected items up in the queue."""
@@ -965,7 +2102,8 @@ class YouTubeDownloaderApp:
         # Restore selection
         self.tree.selection_set(moved_items)
         self.log_message(f"Moved {len(moved_items)} item(s) up in the queue.")
-        self.save_settings()
+        self.update_line_numbers()  # Update line numbers after moving
+        self.schedule_save_settings()
 
     def move_down(self):
         """Moves selected items down in the queue."""
@@ -1002,7 +2140,93 @@ class YouTubeDownloaderApp:
         # Restore selection
         self.tree.selection_set(moved_items)
         self.log_message(f"Moved {len(moved_items)} item(s) down in the queue.")
-        self.save_settings()
+        self.update_line_numbers()  # Update line numbers after moving
+        self.schedule_save_settings()
+
+    def move_to_top(self):
+        """Moves selected items to the top of the queue."""
+        selected_items = self.tree.selection()
+        if not selected_items:
+            messagebox.showwarning("Warning", "No video selected to move.")
+            return
+
+        # Get all items and their positions
+        all_items = self.tree.get_children()
+        
+        # Check if the first selected item is already at the top
+        if selected_items[0] == all_items[0]:
+            return  # Already at the top
+        
+        # Move each selected item to the top (process in reverse order to maintain relative order)
+        moved_items = []
+        videos_to_move = []
+        
+        # First, collect all videos to move and remove them from the queue
+        for item_id in reversed(selected_items):
+            for i, video in enumerate(self.download_queue):
+                if video['item_id'] == item_id:
+                    video_to_move = self.download_queue.pop(i)
+                    videos_to_move.append(video_to_move)
+                    break
+        
+        # Insert all videos at the beginning of the queue (reverse order to maintain selection order)
+        for video in reversed(videos_to_move):
+            self.download_queue.insert(0, video)
+        
+        # Move items in treeview to the top
+        for i, item_id in enumerate(selected_items):
+            self.tree.move(item_id, '', i)
+            moved_items.append(item_id)
+        
+        # Restore selection
+        self.tree.selection_set(moved_items)
+        self.log_message(f"Moved {len(moved_items)} item(s) to the top of the queue.")
+        self.update_line_numbers()  # Update line numbers after moving
+        self.schedule_save_settings()
+
+    def move_to_bottom(self):
+        """Moves selected items to the bottom of the queue."""
+        selected_items = self.tree.selection()
+        if not selected_items:
+            messagebox.showwarning("Warning", "No video selected to move.")
+            return
+
+        # Get all items and their positions
+        all_items = self.tree.get_children()
+        
+        # Check if the last selected item is already at the bottom
+        if selected_items[-1] == all_items[-1]:
+            return  # Already at the bottom
+        
+        # Move each selected item to the bottom (maintain relative order)
+        moved_items = []
+        videos_to_move = []
+        
+        # First, collect all videos to move and remove them from the queue
+        for item_id in selected_items:
+            for i, video in enumerate(self.download_queue):
+                if video['item_id'] == item_id:
+                    video_to_move = self.download_queue.pop(i)
+                    videos_to_move.append(video_to_move)
+                    break
+        
+        # Append all videos to the end of the queue (maintain selection order)
+        for video in videos_to_move:
+            self.download_queue.append(video)
+        
+        # Move items in treeview to the bottom
+        total_items = len(all_items)
+        for i, item_id in enumerate(selected_items):
+            # Move to the end, accounting for items already moved
+            target_position = total_items - len(selected_items) + i
+            self.tree.move(item_id, '', target_position)
+            moved_items.append(item_id)
+        
+        # Restore selection
+        self.tree.selection_set(moved_items)
+        self.log_message(f"Moved {len(moved_items)} item(s) to the bottom of the queue.")
+        self.update_line_numbers()  # Update line numbers after moving
+        self.schedule_save_settings()
 
     def sort_treeview(self, column):
         """Sorts the treeview by the specified column."""
@@ -1046,7 +2270,7 @@ class YouTubeDownloaderApp:
         
         self.download_queue = new_queue
         self.log_message(f"Sorted by {column} ({'descending' if self.sort_reverse else 'ascending'})")
-        self.save_settings()
+        self.schedule_save_settings()
 
     def update_column_headings(self):
         """Updates column headings to show sort indicators."""
@@ -1091,6 +2315,20 @@ class YouTubeDownloaderApp:
             messagebox.showwarning("Warning", "A download is already in progress.")
             return
         
+        # Trigger SABR detection if not in SABR mode and haven't checked recently
+        should_check_sabr = (
+            not self.sabr_mode_active and 
+            (self.last_sabr_check is None or 
+             (time.time() - self.last_sabr_check) > 3600) and  # Check every hour
+            pending_videos
+        )
+        
+        if should_check_sabr:
+            test_url = pending_videos[0].get('url', '')
+            if test_url:
+                self.log_message("Triggering SABR detection before download start...", "DEBUG")
+                self.trigger_sabr_detection(test_url)
+        
         self.is_downloading = True
         self.stop_event.clear()
         self.update_button_states()
@@ -1102,17 +2340,24 @@ class YouTubeDownloaderApp:
     def stop_download(self):
         """Signals the download thread to stop."""
         if self.is_downloading:
+            self._stop_start_time = time.time()
+            self._current_download_cancelled = True
+            self.log_message("STOP: User clicked stop button", "WARNING")
             self.stop_event.set()
+            self.log_message("STOP: Stop event flag set", "WARNING")
             self.log_message("--- Stop signal sent. Stopping after current file... ---", "WARNING")
             self.log_message("Note: Current download will be reset to pending status.", "INFO")
             
             # Update button states immediately to show stop is in progress
-            self.stop_button.config(text="Stopping...", state=tk.DISABLED)
+            self.stop_button.config(text="⏸", state=tk.DISABLED)  # Pause icon to indicate stopping
+            self.log_message("STOP: Stop button disabled", "WARNING")
             
             # If there's an active yt-dlp process, we can't force stop it
             # but we can prevent new downloads from starting
             if self.ydl_process:
-                self.log_message("Waiting for current download to finish...", "INFO")
+                self.log_message("STOP: Active yt-dlp process detected, waiting for cancellation...", "WARNING")
+            else:
+                self.log_message("STOP: No active yt-dlp process", "WARNING")
 
     def download_worker(self):
         """The main worker function that downloads videos one by one."""
@@ -1156,104 +2401,126 @@ class YouTubeDownloaderApp:
                 self.last_progress_time = 0  # Reset progress timer for new download
                 self.stop_message_logged = False  # Reset stop message flag for new download
                 
-                # Setup yt-dlp options with download archive and enhanced reliability
-                ydl_opts = {
-                    'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'), 
-                    'progress_hooks': [self.progress_hook], 
-                    'nocheckcertificate': True,
-                    'download_archive': os.path.join(download_path, 'download-archive.txt'),  # Prevent re-downloads
-                    'ignoreerrors': True,
-                    # Enhanced reliability options
-                    'retries': 3,  # Retry failed downloads up to 3 times
-                    'fragment_retries': 3,  # Retry failed fragments
-                    'retry_sleep_functions': {'http': lambda n: min(4 ** n, 60)},  # Exponential backoff
-                    'socket_timeout': 30,  # 30 second socket timeout
-                    'http_chunk_size': 10485760,  # 10MB chunks for better performance
-                    # User agent and headers to avoid blocking
-                    'http_headers': {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                    },
-                    # Additional options for better compatibility
-                    'extractor_retries': 3,
-                    'no_color': True,  # Disable color output for cleaner logs
-                    'writethumbnail': False,  # Don't download thumbnails to save space
-                    'writeinfojson': False,  # Don't write info JSON files
-                    'writesubtitles': False,  # Don't download subtitles by default
-                    'writeautomaticsub': False,  # Don't download auto-generated subtitles
-                    # Fix for YouTube SABR protocol issue (2025)
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': ['android', 'ios', 'tv']  # Workaround for SABR; list for Python API and fallbacks
-                        }
-                    }
-                }
-                
-                if video_info['quality'].startswith('Audio-'):
-                    audio_format = video_info['quality'].split('-')[1]  # 'default', 'best' or 'mp3'
-                    if audio_format == 'default':
-                        # Use default audio format (most compatible, fallback-friendly)
-                        ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best'
-                        # No postprocessors - keep original format
-                    elif audio_format == 'best':
-                        # Use native audio format (no transcoding)
-                        ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best'
-                        ydl_opts['postprocessors'] = [{
-                            'key': 'FFmpegExtractAudio',
-                            'preferredcodec': 'best',
-                            'preferredquality': '0',
-                            'nopostoverwrites': False,
-                        }]
-                    else:
-                        # Use mp3 format (with transcoding)
-                        ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best'
-                        ydl_opts['postprocessors'] = [{
-                            'key': 'FFmpegExtractAudio', 
-                            'preferredcodec': 'mp3', 
-                            'preferredquality': '192'
-                        }]
-                else:
-                    quality = video_info['quality']
-                    if quality == 'Best':
-                        # Prefer best separate video+audio, fallback to single-file best
-                        ydl_opts['format'] = 'bv*+ba/b'
-                    else:
-                        height = quality[:-1]  # Remove 'p' from '1080p'
-                        # Prefer separate video+audio with height constraint, with chained fallbacks
-                        if height == '1080':
-                            ydl_opts['format'] = 'bv*[height<=1080]+ba/bv*[height<=720]+ba/bv*[height<=480]+ba/bv*[height<=360]+ba/b'
-                        elif height == '720':
-                            ydl_opts['format'] = 'bv*[height<=720]+ba/bv*[height<=480]+ba/bv*[height<=360]+ba/b'
-                        elif height == '480':
-                            ydl_opts['format'] = 'bv*[height<=480]+ba/bv*[height<=360]+ba/b'
-                        else:  # 360p
-                            ydl_opts['format'] = 'bv*[height<=360]+ba/b'
-                    ydl_opts['merge_output_format'] = 'mp4'  # Ensure output is mp4
+                # Setup yt-dlp options using unified builder
+                ydl_opts = self.build_ydl_opts(video_info, download_path, for_download=True)
                 
                 # Log the yt-dlp configuration for debugging
-                self.log_message(f"yt-dlp configuration: format='{ydl_opts.get('format', 'default')}', retries={ydl_opts.get('retries', 0)}", "DEBUG")
-                self.log_message("Using android client to work around YouTube's SABR protocol", "DEBUG")
+                # Log configuration only once per session to reduce spam
+                if not hasattr(self, '_config_logged'):
+                    self.log_message(f"yt-dlp configuration: format='{ydl_opts.get('format', 'default')}', retries={ydl_opts.get('retries', 0)}", "DEBUG")
+                    self.log_message("Using android client to work around YouTube's SABR protocol", "DEBUG")
+                    self._config_logged = True
+                
+                # Clear any previous cancellation flags
+                self._current_download_cancelled = False
+                
+                # Create a cancellation monitor for this download
+                download_cancelled = threading.Event()
+                
+                def cancellation_monitor():
+                    """Monitor for stop requests and interrupt yt-dlp if needed"""
+                    start_time = time.time()
+                    while not download_cancelled.is_set():
+                        if self.stop_event.is_set():
+                            elapsed = time.time() - start_time
+                            self.log_message(f"MONITOR: Stop detected after {elapsed:.1f}s, forcing cancellation", "WARNING")
+                            
+                            # Try to interrupt more aggressively
+                            if hasattr(self, 'ydl_process') and self.ydl_process:
+                                try:
+                                    # Try to interrupt the yt-dlp process more directly
+                                    self.log_message("MONITOR: Attempting to interrupt yt-dlp process", "WARNING")
+                                    # Set a flag that our custom logger will check
+                                    download_cancelled.set()
+                                except Exception as e:
+                                    self.log_message(f"MONITOR: Error interrupting process: {e}", "WARNING")
+                            
+                            download_cancelled.set()
+                            return
+                        time.sleep(0.05)  # Check every 50ms for faster response
+                
+                # Start the cancellation monitor
+                monitor_thread = threading.Thread(target=cancellation_monitor, daemon=True)
+                monitor_thread.start()
+                
+                # Create a timeout mechanism for the entire yt-dlp operation
+                download_result = {'success': False, 'error': None}
+                
+                def run_ytdlp():
+                    """Run yt-dlp in a separate thread so we can timeout/cancel it"""
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            # Store reference for potential termination
+                            self.ydl_process = ydl
+                            
+                            # Check for stop before starting download
+                            if self.stop_event.is_set() or download_cancelled.is_set():
+                                self.log_message("STOP: Download stopped before starting this video.", "WARNING")
+                                download_result['error'] = 'cancelled_before_start'
+                                return
+                            
+                            # Use stored info object if available, otherwise download by URL
+                            if 'info' in video_info and video_info['info']:
+                                # Use cached info silently to reduce log spam
+                                pass
+                                # Check for stop before processing
+                                if self.stop_event.is_set() or download_cancelled.is_set():
+                                    self.log_message("STOP: Cancelled before processing cached info", "WARNING")
+                                    raise yt_dlp.utils.DownloadCancelled('User requested stop')
+                                ydl.process_ie_result(video_info['info'])
+                            else:
+                                # URL logging handled by yt-dlp debug output
+                                pass
+                                # Check for stop before download
+                                if self.stop_event.is_set() or download_cancelled.is_set():
+                                    self.log_message("STOP: Cancelled before starting download", "WARNING")
+                                    raise yt_dlp.utils.DownloadCancelled('User requested stop')
+                                ydl.download([video_info['url']])
+                        
+                        download_result['success'] = True
+                    except Exception as e:
+                        download_result['error'] = e
+                
+                # Start yt-dlp in a separate thread
+                ytdlp_thread = threading.Thread(target=run_ytdlp, daemon=True)
+                ytdlp_thread.start()
+                
+                # Wait for completion or cancellation with timeout
+                start_time = time.time()
+                while ytdlp_thread.is_alive():
+                    if self.stop_event.is_set() or download_cancelled.is_set():
+                        elapsed = time.time() - start_time
+                        self.log_message(f"TIMEOUT: Forcing termination after {elapsed:.1f}s", "WARNING")
+                        # Give yt-dlp a moment to respond to cancellation
+                        ytdlp_thread.join(timeout=1.0)
+                        if ytdlp_thread.is_alive():
+                            self.log_message("TIMEOUT: yt-dlp thread still alive, raising cancellation", "WARNING")
+                            raise yt_dlp.utils.DownloadCancelled('Forced timeout cancellation')
+                        break
+                    time.sleep(0.1)
+                
+                # Check the result
+                if download_result.get('error'):
+                    if download_result['error'] == 'cancelled_before_start':
+                        # Reset status back to pending since we didn't actually start
+                        self.root.after(0, self.update_video_status, video_info['item_id'], 'Pending')
+                        current_downloading_video = None
+                        break
+                    else:
+                        raise download_result['error']
                 
                 try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        # Store reference for potential termination
-                        self.ydl_process = ydl
-                        
-                        # Check for stop before starting download
-                        if self.stop_event.is_set():
-                            self.log_message("Download stopped before starting this video.", "WARNING")
-                            # Reset status back to pending since we didn't actually start
-                            self.root.after(0, self.update_video_status, video_info['item_id'], 'Pending')
-                            current_downloading_video = None
-                            break
-                        
-                        # Use stored info object if available, otherwise download by URL
-                        if 'info' in video_info and video_info['info']:
-                            self.log_message("Using cached video info for download", "DEBUG")
-                            ydl.process_ie_result(video_info['info'])
-                        else:
-                            self.log_message(f"Downloading from URL: {video_info['url']}", "DEBUG")
-                            ydl.download([video_info['url']])
-                            
+                    pass  # Placeholder for the original try block content
+
+                
+                except yt_dlp.utils.DownloadCancelled:
+                    # Handle user-requested cancellation
+                    self.log_message('CANCEL: DownloadCancelled exception caught', 'WARNING')
+                    self.log_message('CANCEL: Resetting video status to Pending', 'WARNING')
+                    self.root.after(0, self.update_video_status, video_info['item_id'], 'Pending')
+                    current_downloading_video = None
+                    self.log_message('CANCEL: Breaking out of download loop', 'WARNING')
+                    break
                 except yt_dlp.DownloadError as e:
                     # Handle yt-dlp specific download errors
                     error_msg = str(e)
@@ -1269,6 +2536,9 @@ class YouTubeDownloaderApp:
                     error_msg = str(e)
                     self.log_message(f"yt-dlp error: {error_msg}", "ERROR")
                     raise
+                finally:
+                    # Always signal the monitor to stop
+                    download_cancelled.set()
 
                 # Check if stop was requested after download completion
                 if self.stop_event.is_set():
@@ -1278,19 +2548,36 @@ class YouTubeDownloaderApp:
                     current_downloading_video = None
                     break
                 
-                # Set status to done and move to next video
-                self.root.after(0, self.update_video_status, video_info['item_id'], 'Done')
-                self.log_message(f"Successfully downloaded: {video_info['title']}", "INFO")
+                # Validate downloaded file and update format info
+                validation_result = self.validate_downloaded_file(video_info)
+                
+                if validation_result['success']:
+                    # Set status to done and update format column with actual downloaded info
+                    self.root.after(0, self.update_video_status, video_info['item_id'], 'Done')
+                    self.root.after(0, self.update_video_quality_in_gui, video_info['item_id'], validation_result['actual_format'])
+                    
+                    # Enhanced completion logging with progress context
+                    remaining = len([v for v in self.download_queue[current_index+1:] if v.get('status', 'Pending') == 'Pending'])
+                    if remaining > 0:
+                        self.log_message(f"Successfully downloaded: {video_info['title']} ({remaining} remaining)", "INFO")
+                    else:
+                        self.log_message(f"Successfully downloaded: {video_info['title']}", "INFO")
+                else:
+                    # File validation failed - mark as failed
+                    self.root.after(0, self.update_video_status, video_info['item_id'], 'Failed')
+                    self.log_message(f"Download validation failed for '{video_info['title']}': {validation_result['error']}", "ERROR")
                 current_downloading_video = None
                 current_index += 1
                 
             except Exception as e:
                 if self.stop_event.is_set():
-                    self.log_message("Download stopped by user.", "WARNING")
+                    self.log_message(f"EXCEPTION: Download stopped by user during exception: {type(e).__name__}", "WARNING")
                     # Reset the currently downloading video back to pending
                     if current_downloading_video:
+                        self.log_message("EXCEPTION: Resetting interrupted video to Pending", "WARNING")
                         self.root.after(0, self.update_video_status, current_downloading_video['item_id'], 'Pending')
                         current_downloading_video = None
+                    self.log_message("EXCEPTION: Breaking out of download loop", "WARNING")
                     break
                 
                 # Classify the error and set appropriate status
@@ -1316,8 +2603,14 @@ class YouTubeDownloaderApp:
         # Check if we stopped due to user request
         was_stopped = self.stop_event.is_set()
         
+        if was_stopped:
+            self.log_message("WORKER: Download worker exiting due to stop request", "WARNING")
+        else:
+            self.log_message("WORKER: Download worker exiting normally", "INFO")
+        
         self.is_downloading = False
         self.stop_event.clear()
+        self.log_message("WORKER: Download flags cleared", "WARNING" if was_stopped else "INFO")
         
         # Count remaining pending videos
         remaining_pending = sum(1 for v in self.download_queue if v.get('status', 'Pending') == 'Pending')
@@ -1348,7 +2641,7 @@ class YouTubeDownloaderApp:
         # Update GUI with status text and colors
         current_values = list(self.tree.item(item_id, 'values'))
         if len(current_values) >= 5:
-            # Set status display text and color tag
+            # Set status display text and color tag (Status is back to index 4)
             if status == 'Pending':
                 current_values[4] = 'Pending'
                 self.tree.item(item_id, values=current_values, tags=('pending',))
@@ -1374,6 +2667,7 @@ class YouTubeDownloaderApp:
         # Update reset button state and status summary
         self.update_reset_button_state()
         self.update_status_summary()
+        self.update_line_numbers()  # Update line numbers when status changes
 
 
 
@@ -1389,7 +2683,7 @@ class YouTubeDownloaderApp:
         for item_id in selected_items:
             current_values = self.tree.item(item_id, 'values')
             if len(current_values) >= 5:
-                status = current_values[4]
+                status = current_values[4]  # Status is back to index 4
                 if status in ['Done', 'Failed', 'Skipped', 'QualityBlocked', 'AgeRestricted']:
                     resetable_items.append(item_id)
         
@@ -1398,9 +2692,33 @@ class YouTubeDownloaderApp:
             return
         
         if messagebox.askyesno("Confirm Reset", f"Are you sure you want to reset {len(resetable_items)} video(s)? This will delete existing files and restart the download."):
-            download_path = self.download_path.get()
+            # Disable reset button during operation
+            self.reset_button.config(state=tk.DISABLED)
+            self.log_message(f"Resetting {len(resetable_items)} video(s)...")
             
-            for item_id in resetable_items:
+            # Start background worker
+            threading.Thread(target=self._reset_worker, args=(resetable_items,), daemon=True).start()
+
+    def _reset_worker(self, item_ids):
+        """Background worker to reset videos without blocking UI."""
+        try:
+            download_path = self.download_path.get()
+            archive_path = os.path.join(download_path, 'download-archive.txt')
+            
+            # Load archive once into memory for efficient processing
+            archive_lines = []
+            if os.path.exists(archive_path):
+                try:
+                    with open(archive_path, 'r', encoding='utf-8') as f:
+                        archive_lines = f.readlines()
+                except Exception as e:
+                    self.root.after(0, lambda: self.log_message(f"Error reading archive: {e}", "WARNING"))
+            
+            # Collect video IDs to remove from archive
+            video_ids_to_remove = set()
+            videos_to_reset = []
+            
+            for item_id in item_ids:
                 # Find video info
                 video_info = None
                 for video in self.download_queue:
@@ -1408,55 +2726,86 @@ class YouTubeDownloaderApp:
                         video_info = video
                         break
                 
-                if video_info:
-                    # Try to delete existing file and remove from download archive
-                    try:
-                        # Remove from download archive if it exists
-                        archive_path = os.path.join(download_path, 'download-archive.txt')
-                        if os.path.exists(archive_path) and video_info.get('id'):
-                            with open(archive_path, 'r', encoding='utf-8') as f:
-                                lines = f.readlines()
-                            
-                            # Filter out the video ID from archive
-                            new_lines = [line for line in lines if not line.strip().endswith(video_info['id'])]
-                            
-                            if len(new_lines) != len(lines):
-                                with open(archive_path, 'w', encoding='utf-8') as f:
-                                    f.writelines(new_lines)
-                                self.log_message(f"Removed {video_info['title']} from download archive")
-                        
-                        # Try to find and delete the actual file (best effort)
-                        # This is less reliable but still useful for cleanup
-                        if video_info['quality'].startswith('Audio-'):
-                            audio_format = video_info['quality'].split('-')[1]
-                            if audio_format == 'default':
-                                # Default format - could be various audio formats
-                                possible_extensions = ['.webm', '.m4a', '.aac', '.mp3', '.ogg', '.opus']
-                            elif audio_format == 'best':
-                                # Could be m4a, aac, or other formats
-                                possible_extensions = ['.m4a', '.aac', '.webm', '.mp4']
-                            else:
-                                possible_extensions = ['.mp3']
-                        else:
-                            possible_extensions = ['.mp4', '.mkv', '.webm']
-                        
-                        # Try to find files with the video title
-                        title_safe = re.sub(r'[<>:"/\\|?*]', '_', video_info['title'])
-                        for ext in possible_extensions:
-                            potential_file = os.path.join(download_path, f"{title_safe}{ext}")
-                            if os.path.exists(potential_file):
-                                os.remove(potential_file)
-                                self.log_message(f"Deleted existing file: {os.path.basename(potential_file)}")
-                                break
-                                
-                    except Exception as e:
-                        self.log_message(f"Error during reset for {video_info['title']}: {e}", "WARNING")
-                    
-                    # Reset status to Pending
-                    self.update_video_status(item_id, 'Pending')
+                if video_info and video_info.get('id'):
+                    video_ids_to_remove.add(video_info['id'])
+                    videos_to_reset.append((item_id, video_info))
             
-            self.log_message(f"Reset {len(resetable_items)} video(s) to Pending status.")
-            self.update_status_summary()  # Update status summary after reset
+            # Remove all selected IDs from archive in one pass
+            if video_ids_to_remove and archive_lines:
+                new_lines = []
+                removed_count = 0
+                for line in archive_lines:
+                    line_stripped = line.strip()
+                    should_remove = False
+                    for video_id in video_ids_to_remove:
+                        if line_stripped.endswith(video_id):
+                            should_remove = True
+                            removed_count += 1
+                            break
+                    if not should_remove:
+                        new_lines.append(line)
+                
+                # Write archive once if changes were made
+                if removed_count > 0:
+                    try:
+                        with open(archive_path, 'w', encoding='utf-8') as f:
+                            f.writelines(new_lines)
+                        self.root.after(0, lambda: self.log_message(f"Removed {removed_count} video(s) from download archive"))
+                    except Exception as e:
+                        self.root.after(0, lambda: self.log_message(f"Error updating archive: {e}", "WARNING"))
+            
+            # Batch file deletions
+            deleted_files = 0
+            for item_id, video_info in videos_to_reset:
+                try:
+                    # Determine possible file extensions based on quality
+                    if video_info['quality'].startswith('Audio-'):
+                        audio_format = video_info['quality'].split('-')[1]
+                        if audio_format == 'default':
+                            possible_extensions = ['.webm', '.m4a', '.aac', '.mp3', '.ogg', '.opus']
+                        elif audio_format == 'best':
+                            possible_extensions = ['.m4a', '.aac', '.webm', '.mp4']
+                        else:
+                            possible_extensions = ['.mp3']
+                    else:
+                        possible_extensions = ['.mp4', '.mkv', '.webm']
+                    
+                    # Try to find and delete files
+                    title_safe = re.sub(r'[<>:"/\\|?*]', '_', video_info['title'])
+                    for ext in possible_extensions:
+                        potential_file = os.path.join(download_path, f"{title_safe}{ext}")
+                        if os.path.exists(potential_file):
+                            os.remove(potential_file)
+                            deleted_files += 1
+                            self.root.after(0, lambda filename=os.path.basename(potential_file): 
+                                          self.log_message(f"Deleted existing file: {filename}"))
+                            break
+                            
+                except Exception as e:
+                    self.root.after(0, lambda title=video_info['title'], error=str(e): 
+                                  self.log_message(f"Error during reset for {title}: {error}", "WARNING"))
+                
+                # Update status to Pending on UI thread
+                self.root.after(0, lambda id=item_id: self.update_video_status(id, 'Pending'))
+            
+            # Re-enable reset button and update UI on main thread
+            def finish_reset():
+                self.reset_button.config(state=tk.NORMAL)
+                self.update_status_summary()
+                self.schedule_save_settings()
+                self.log_message(f"Reset {len(videos_to_reset)} video(s) to Pending status.")
+                if deleted_files > 0:
+                    self.log_message(f"Deleted {deleted_files} existing file(s).")
+            
+            self.root.after(0, finish_reset)
+            
+        except Exception as e:
+            # Handle any unexpected errors
+            def handle_error():
+                self.reset_button.config(state=tk.NORMAL)
+                self.log_message(f"Error during reset operation: {e}", "ERROR")
+            
+            self.root.after(0, handle_error)
 
     def update_reset_button_state(self):
         """Enable/disable reset button based on selection."""
@@ -1466,7 +2815,7 @@ class YouTubeDownloaderApp:
         for item_id in selected_items:
             current_values = self.tree.item(item_id, 'values')
             if len(current_values) >= 5:
-                status = current_values[4]
+                status = current_values[4]  # Status is back to index 4
                 if status in ['Done', 'Failed', 'Skipped', 'QualityBlocked', 'AgeRestricted']:
                     resetable_count += 1
         
@@ -1653,12 +3002,15 @@ class YouTubeDownloaderApp:
             self.log_message("• Try downloading as Audio Only to bypass video processing", "INFO")
 
     def progress_hook(self, d):
-        # Check if stop was requested during download
-        if self.stop_event.is_set():
-            # We can't actually stop yt-dlp mid-download, but we can log it once
-            if d['status'] == 'downloading' and not self.stop_message_logged:
+        # Check if stop was requested during download and actively cancel
+        if self.stop_event.is_set() and d.get('status') in ('downloading', 'processing'):
+            if not self.stop_message_logged:
                 self.progress_queue.put({'status': 'stop_requested'})
                 self.stop_message_logged = True
+                # Log the cancellation attempt with timestamp
+                self.progress_queue.put({'status': 'cancellation_attempt', 'phase': d.get('status', 'unknown')})
+            # Raise cancellation exception to immediately stop yt-dlp
+            raise yt_dlp.utils.DownloadCancelled('User requested stop')
         self.progress_queue.put(d)
 
     def process_progress_queue(self):
@@ -1667,11 +3019,14 @@ class YouTubeDownloaderApp:
             while not self.progress_queue.empty():
                 d = self.progress_queue.get_nowait()
                 if d['status'] == 'stop_requested':
-                    self.log_message("Stop requested - waiting for current download to complete...", "WARNING")
+                    self.log_message("PROGRESS: Stop requested - waiting for current download to complete...", "WARNING")
+                elif d['status'] == 'cancellation_attempt':
+                    phase = d.get('phase', 'unknown')
+                    self.log_message(f"PROGRESS: Attempting to cancel yt-dlp during {phase} phase", "WARNING")
                 elif d['status'] == 'downloading':
                     current_time = time.time()
-                    # Only update progress every 30 seconds
-                    if current_time - self.last_progress_time >= 30:
+                    # Only update progress every 5 seconds for better user feedback
+                    if current_time - self.last_progress_time >= 5:
                         percent_str = self.clean_ansi_codes(d.get('_percent_str', '0.0%').strip())
                         speed_str = self.clean_ansi_codes(d.get('_speed_str', 'N/A').strip())
                         eta_str = self.clean_ansi_codes(d.get('_eta_str', 'N/A').strip())
@@ -1687,6 +3042,19 @@ class YouTubeDownloaderApp:
             pass # Ignore if queue is empty
         finally: 
             self.root.after(200, self.process_progress_queue) # Poll every 200ms
+
+    def process_message_queue(self):
+        """Processes yt-dlp messages from the queue and displays them in the console."""
+        try:
+            while not self.message_queue.empty():
+                message_data = self.message_queue.get_nowait()
+                # Only process the message if debug is enabled (check on GUI thread)
+                if self.yt_dlp_debug_var.get():
+                    self.log_message(message_data['message'], message_data['level'])
+        except Exception:
+            pass  # Ignore if queue is empty or other errors
+        finally:
+            self.root.after(100, self.process_message_queue)  # Poll every 100ms for more responsive logging
 
     def clean_ansi_codes(self, text):
         """Remove ANSI color codes from text."""
@@ -1707,11 +3075,18 @@ class YouTubeDownloaderApp:
             
         self.console.config(state=tk.NORMAL)
 
+        # Add timestamp for stop-related messages or when level is WARNING/ERROR
+        timestamp = ""
+        if level.upper() in ['WARNING', 'ERROR'] or 'stop' in msg.lower() or 'cancel' in msg.lower():
+            import datetime
+            now = datetime.datetime.now()
+            timestamp = f"[{now.strftime('%H:%M:%S.%f')[:-3]}] "
+
         # Add level prefix to message
         if level.upper() != 'INFO':
-            formatted_msg = f"[{level.upper()}] {msg}"
+            formatted_msg = f"{timestamp}[{level.upper()}] {msg}"
         else:
-            formatted_msg = msg
+            formatted_msg = f"{timestamp}{msg}"
 
         if overwrite:
             # Check if the last line is a progress line. If so, delete it.
@@ -1742,25 +3117,633 @@ class YouTubeDownloaderApp:
         self.move_down_button.config(state=state)
         self.add_button.config(state=state)
         self.change_path_button.config(state=state)
-        self.test_download_button.config(state=state)  # Test download button follows same state
+        self.clear_logs_button.config(state=tk.NORMAL)  # Clear logs button is always enabled
         if self.is_downloading:
-            self.stop_button.config(state=tk.NORMAL, text="Stop")
+            self.stop_button.config(state=tk.NORMAL, text="⏹")
         else:
-            self.stop_button.config(state=tk.DISABLED, text="Stop")
+            self.stop_button.config(state=tk.DISABLED, text="⏹")
         
         # Reset button is handled separately by update_reset_button_state
         if not self.is_downloading:
             self.update_reset_button_state()
             self.update_status_summary()
 
+    # --- SABR Bypass Mode Functions ---
+    
+    def detect_sabr_mode(self, test_url):
+        """
+        Detect if YouTube SABR is enforced using yt-dlp web client probe.
+        Returns: (is_sabr_detected: bool, detection_details: dict)
+        """
+        try:
+            # Use print for debugging in test scenarios where GUI might not be available
+            try:
+                self.log_message("Checking for SABR restrictions...", "DEBUG")
+            except:
+                print("Checking for SABR restrictions...")
+            
+            detection_details = {
+                'test_url': test_url,
+                'web_client_sabr': False,
+                'tv_client_working': False,
+                'warnings_detected': [],
+                'timestamp': time.time(),
+                'detection_method': 'web_client_probe'
+            }
+            
+            # First, check if we can detect SABR from recent warnings in the current session
+            # This is faster and can catch SABR symptoms from normal operations
+            recent_sabr_detected = self.check_recent_warnings_for_sabr()
+            if recent_sabr_detected:
+                detection_details['web_client_sabr'] = True
+                detection_details['detection_method'] = 'recent_warnings'
+                detection_details['warnings_detected'] = ['PO Token warnings detected in recent operations']
+                try:
+                    self.log_message("SABR detected from recent PO Token warnings", "DEBUG")
+                except:
+                    print("SABR detected from recent PO Token warnings")
+                
+                # Still check TV client as control
+                try:
+                    detection_details['tv_client_working'] = self.quick_tv_client_check(test_url)
+                except:
+                    detection_details['tv_client_working'] = False
+                
+                is_sabr_detected = True
+                try:
+                    self.log_message("SABR restrictions detected from recent warnings - switching to bypass mode", "INFO")
+                except:
+                    print("SABR restrictions detected from recent warnings - switching to bypass mode")
+                
+                return is_sabr_detected, detection_details
+            
+            # Test using the same client configuration as actual downloads
+            # This ensures SABR detection matches what happens during downloads
+            detection_ydl_opts = {
+                'quiet': True,
+                'skip_download': True,
+                'extractor_args': self.build_extractor_args(),  # Use same config as downloads
+                'no_warnings': False
+            }
+            
+            detection_warnings = []
+            
+            class SabrDetectionLogger:
+                def debug(self, msg): pass
+                def info(self, msg): pass
+                def warning(self, msg): 
+                    detection_warnings.append(msg)
+                def error(self, msg): 
+                    detection_warnings.append(msg)
+                def to_screen(self, msg): pass
+            
+            try:
+                with yt_dlp.YoutubeDL(detection_ydl_opts) as ydl:
+                    ydl.params['logger'] = SabrDetectionLogger()
+                    info = ydl.extract_info(test_url, download=False)
+                    formats = info.get('formats', [])
+                    
+                    # Check for HTTPS formats with direct URLs
+                    https_formats_with_url = [
+                        f for f in formats 
+                        if f.get('url', '').startswith('https://') and 'signatureCipher' not in f
+                    ]
+                    
+                    # Check for SABR warning messages and PO Token warnings (which indicate SABR restrictions)
+                    sabr_warnings = [
+                        w for w in detection_warnings 
+                        if any(keyword in w.lower() for keyword in [
+                            'sabr', 'missing a url', 'forcing sabr', 
+                            'po token', 'gvs po token', 'require a gvs po token',
+                            'android client https formats require a gvs po token',
+                            'ios client https formats require a gvs po token',
+                            'android client sabr formats require',
+                            'ios client sabr formats require'
+                        ])
+                    ]
+                    
+                    detection_details['warnings_detected'] = sabr_warnings
+                    
+                    # SABR detected if we get PO Token warnings (primary indicator)
+                    # OR if no HTTPS formats with direct URLs
+                    sabr_detected_by_warnings = len(sabr_warnings) > 0
+                    sabr_detected_by_formats = len(https_formats_with_url) == 0
+                    
+                    if sabr_detected_by_warnings or sabr_detected_by_formats:
+                        detection_details['web_client_sabr'] = True
+                        try:
+                            self.log_message(f"SABR detected: {len(sabr_warnings)} warnings, {len(https_formats_with_url)} HTTPS formats", "DEBUG")
+                        except:
+                            print(f"SABR detected: {len(sabr_warnings)} warnings, {len(https_formats_with_url)} HTTPS formats")
+                    else:
+                        try:
+                            self.log_message(f"No SABR detected: {len(sabr_warnings)} warnings, {len(https_formats_with_url)} HTTPS formats available", "DEBUG")
+                        except:
+                            print(f"No SABR detected: {len(sabr_warnings)} warnings, {len(https_formats_with_url)} HTTPS formats available")
+                        
+            except Exception as e:
+                try:
+                    self.log_message(f"SABR detection check failed: {e}", "DEBUG")
+                except:
+                    print(f"SABR detection check failed: {e}")
+                detection_details['web_client_sabr'] = False
+            
+            # Test TV client as control (should still work)
+            tv_ydl_opts = {
+                'quiet': True,
+                'skip_download': True,
+                'extractor_args': {'youtube': {'player_client': ['tv']}},
+                'no_warnings': True
+            }
+            
+            try:
+                with yt_dlp.YoutubeDL(tv_ydl_opts) as ydl:
+                    info = ydl.extract_info(test_url, download=False)
+                    formats = info.get('formats', [])
+                    
+                    # Check if TV client has working HTTPS formats
+                    tv_https_formats = [
+                        f for f in formats 
+                        if f.get('url', '').startswith('https://')
+                    ]
+                    
+                    if len(tv_https_formats) > 0:
+                        detection_details['tv_client_working'] = True
+                        try:
+                            self.log_message(f"TV client working: {len(tv_https_formats)} HTTPS formats available", "DEBUG")
+                        except:
+                            print(f"TV client working: {len(tv_https_formats)} HTTPS formats available")
+                    else:
+                        try:
+                            self.log_message("TV client also restricted", "DEBUG")
+                        except:
+                            print("TV client also restricted")
+                        
+            except Exception as e:
+                try:
+                    self.log_message(f"TV client check failed: {e}", "DEBUG")
+                except:
+                    print(f"TV client check failed: {e}")
+                detection_details['tv_client_working'] = False
+            
+            # SABR is detected if web client shows SABR symptoms
+            is_sabr_detected = detection_details['web_client_sabr']
+            
+            if is_sabr_detected:
+                try:
+                    self.log_message("SABR restrictions detected - switching to bypass mode", "INFO")
+                except:
+                    print("SABR restrictions detected - switching to bypass mode")
+            else:
+                try:
+                    self.log_message("No SABR restrictions detected - using normal mode", "DEBUG")
+                except:
+                    print("No SABR restrictions detected - using normal mode")
+            
+            return is_sabr_detected, detection_details
+            
+        except Exception as e:
+            try:
+                self.log_message(f"SABR detection failed: {e}", "ERROR")
+            except:
+                print(f"SABR detection failed: {e}")
+            return False, {'error': str(e), 'timestamp': time.time()}
+    
+    def activate_sabr_mode(self, detection_details):
+        """Activate SABR bypass mode with restricted quality options."""
+        self.log_message(f"ACTIVATING SABR MODE - Detection method: {detection_details.get('detection_method', 'unknown')}", "DEBUG")
+        self.sabr_mode_active = True
+        self.sabr_detection_details = detection_details
+        self.last_sabr_check = time.time()
+        
+        # Update quality dropdowns to restricted options
+        self.update_quality_options_for_sabr()
+        
+        # Show SABR indicator
+        self.show_sabr_indicator()
+        
+        # Hide both SABR control buttons since SABR is now active
+        # The Re-Check SABR button in the indicator serves the same purpose
+        self.log_message("Hiding SABR control buttons...", "DEBUG")
+        if hasattr(self, 'force_sabr_button'):
+            self.force_sabr_button.pack_forget()
+            self.log_message("Force SABR button hidden", "DEBUG")
+        if hasattr(self, 'manual_sabr_button'):
+            self.manual_sabr_button.pack_forget()
+            self.log_message("Check SABR button hidden", "DEBUG")
+        
+        # Update existing queue items to compatible formats
+        self.update_queue_for_sabr_mode()
+        
+        self.log_message("SABR Bypass Mode activated - quality options restricted", "INFO")
+    
+    def deactivate_sabr_mode(self):
+        """Deactivate SABR bypass mode and restore full quality options."""
+        self.log_message("Deactivating SABR Bypass Mode...", "DEBUG")
+        self.sabr_mode_active = False
+        self.sabr_detection_details = {}
+        
+        # Restore full quality options
+        self.log_message("Restoring full quality options...", "DEBUG")
+        self.restore_full_quality_options()
+        
+        # Hide SABR indicator
+        self.log_message("Hiding SABR indicator...", "DEBUG")
+        self.hide_sabr_indicator()
+        
+        # Show both SABR control buttons again since SABR is no longer active
+        self.log_message("Showing SABR control buttons...", "DEBUG")
+        if hasattr(self, 'manual_sabr_button'):
+            self.manual_sabr_button.pack(side=tk.LEFT, padx=(0, 5))
+            self.log_message("Check SABR button shown", "DEBUG")
+        if hasattr(self, 'force_sabr_button'):
+            self.force_sabr_button.pack(side=tk.LEFT, padx=(0, 5))
+            self.log_message("Force SABR button shown", "DEBUG")
+        
+        self.log_message("SABR Bypass Mode deactivated - full quality options restored", "INFO")
+    
+    def update_quality_options_for_sabr(self):
+        """Update quality dropdown menus for SABR mode restrictions."""
+        # Update video quality options
+        current_quality = self.quality_var.get()
+        self.quality_menu['menu'].delete(0, 'end')
+        
+        for option in self.sabr_quality_options:
+            self.quality_menu['menu'].add_command(label=option, command=tk._setit(self.quality_var, option))
+        
+        # Set to compatible quality if current selection is not available
+        if current_quality not in self.sabr_quality_options:
+            self.quality_var.set('360p')  # Only 360p works under SABR
+        
+        # Update audio format options
+        current_audio = self.audio_format_var.get()
+        self.audio_format_menu['menu'].delete(0, 'end')
+        
+        for option in self.sabr_audio_options:
+            self.audio_format_menu['menu'].add_command(label=option, command=tk._setit(self.audio_format_var, option))
+        
+        # Set to compatible audio format if current selection is not available
+        if current_audio not in self.sabr_audio_options:
+            self.audio_format_var.set(self.sabr_audio_options[0])  # Default to standard_mp3
+    
+    def restore_full_quality_options(self):
+        """Restore full quality dropdown options for normal mode."""
+        # Restore video quality options
+        current_quality = self.quality_var.get()
+        self.quality_menu['menu'].delete(0, 'end')
+        
+        for option in self.original_quality_options:
+            self.quality_menu['menu'].add_command(label=option, command=tk._setit(self.quality_var, option))
+        
+        # Restore previous quality if it was valid
+        if current_quality not in self.original_quality_options:
+            self.quality_var.set('1080p')  # Default back to 1080p
+        
+        # Restore audio format options
+        current_audio = self.audio_format_var.get()
+        self.audio_format_menu['menu'].delete(0, 'end')
+        
+        for option in self.original_audio_options:
+            self.audio_format_menu['menu'].add_command(label=option, command=tk._setit(self.audio_format_var, option))
+        
+        # Restore previous audio format if it was valid
+        if current_audio not in self.original_audio_options:
+            self.audio_format_var.set('default (Auto)')  # Default back to auto
+    
+    def update_queue_for_sabr_mode(self):
+        """Update existing queue items to use SABR-compatible formats."""
+        updated_count = 0
+        
+        for video_info in self.download_queue:
+            if video_info.get('status') in ['Done', 'Failed']:
+                continue  # Skip completed/failed items
+            
+            original_quality = video_info.get('quality', '')
+            
+            # Update video quality if not compatible
+            if not video_info['quality'].startswith('Audio-') and original_quality not in self.sabr_quality_options:
+                video_info['quality'] = '360p'  # Only 360p works under SABR
+                updated_count += 1
+            
+            # Update audio quality if not compatible
+            elif video_info['quality'].startswith('Audio-'):
+                audio_format = video_info['quality'].replace('Audio-', '')
+                if audio_format not in [opt.split(' ')[0] for opt in self.sabr_audio_options]:
+                    video_info['quality'] = 'Audio-standard_mp3'  # Default SABR audio quality
+                    updated_count += 1
+        
+        if updated_count > 0:
+            self.log_message(f"Updated {updated_count} queue items to SABR-compatible formats", "INFO")
+            self.refresh_tree_display()
+    
+    def refresh_tree_display(self):
+        """Refresh the tree display to show updated queue items."""
+        # Clear and rebuild tree
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Re-add all items
+        for video in self.download_queue:
+            item_id = self.tree.insert('', 'end', iid=video['item_id'], values=(
+                self.format_video_id_with_icon(video.get('id', 'N/A')),
+                video['title'],
+                video['quality'],
+                self.format_duration(video.get('duration')),
+                video.get('status', 'Pending')
+            ))
+            
+            # Apply status-based styling
+            status = video.get('status', 'Pending')
+            if status == 'Done':
+                self.tree.item(item_id, tags=('done',))
+            elif status == 'Failed':
+                self.tree.item(item_id, tags=('failed',))
+            elif status == 'Downloading':
+                self.tree.item(item_id, tags=('downloading',))
+            else:
+                self.tree.item(item_id, tags=('pending',))
+        
+        self.update_status_summary()
+        self.update_line_numbers()  # Update line numbers after refresh
+    
+    def show_sabr_indicator(self):
+        """Show the SABR mode indicator widget."""
+        if self.sabr_indicator_frame is not None:
+            return  # Already showing
+        
+        # Use the dedicated SABR control frame
+        if hasattr(self, 'sabr_control_frame'):
+            # Create SABR indicator frame
+            self.sabr_indicator_frame = ttk.Frame(self.sabr_control_frame)
+            self.sabr_indicator_frame.pack(side=tk.LEFT, padx=(20, 0))
+            
+            # Red bolt icon
+            sabr_icon = tk.Label(self.sabr_indicator_frame, text="⚡", fg="red", font=("Arial", 12, "bold"))
+            sabr_icon.pack(side=tk.LEFT, padx=(0, 5))
+            
+            # SABR mode text
+            sabr_text = tk.Label(self.sabr_indicator_frame, text="SABR Bypass Mode - quality reduced", fg="red", font=("Arial", 9))
+            sabr_text.pack(side=tk.LEFT, padx=(0, 10))
+            
+            # Re-check button
+            recheck_button = ttk.Button(self.sabr_indicator_frame, text="Re-Check SABR", command=self.recheck_sabr)
+            recheck_button.pack(side=tk.LEFT)
+    
+    def hide_sabr_indicator(self):
+        """Hide the SABR mode indicator widget."""
+        if self.sabr_indicator_frame is not None:
+            self.sabr_indicator_frame.destroy()
+            self.sabr_indicator_frame = None
+    
+    def recheck_sabr(self):
+        """Re-check SABR status and update mode accordingly."""
+        if not self.download_queue:
+            self.log_message("No videos in queue to test SABR detection", "WARNING")
+            return
+        
+        # Use the first video in queue for testing
+        test_url = self.download_queue[0].get('url', '')
+        if not test_url:
+            self.log_message("No valid URL found for SABR re-check", "WARNING")
+            return
+        
+        self.log_message("Re-checking SABR status...", "INFO")
+        
+        # Run detection in background thread to avoid blocking UI
+        def run_recheck():
+            try:
+                is_sabr_detected, detection_details = self.detect_sabr_mode(test_url)
+                
+                # Update UI on main thread
+                self.root.after(0, self.handle_sabr_recheck_result, is_sabr_detected, detection_details)
+            except Exception as e:
+                self.root.after(0, lambda: self.log_message(f"SABR re-check failed: {e}", "ERROR"))
+        
+        threading.Thread(target=run_recheck, daemon=True).start()
+    
+    def handle_sabr_recheck_result(self, is_sabr_detected, detection_details):
+        """Handle the result of SABR re-check on the main thread."""
+        self.log_message(f"SABR recheck result: detected={is_sabr_detected}, current_mode_active={self.sabr_mode_active}", "DEBUG")
+        
+        if is_sabr_detected and not self.sabr_mode_active:
+            # SABR detected but not in bypass mode - activate it
+            self.log_message("SABR detected but not in bypass mode - activating", "DEBUG")
+            self.activate_sabr_mode(detection_details)
+        elif not is_sabr_detected and self.sabr_mode_active:
+            # SABR not detected but in bypass mode - deactivate it
+            self.log_message("SABR not detected but in bypass mode - deactivating", "DEBUG")
+            self.deactivate_sabr_mode()
+        elif is_sabr_detected and self.sabr_mode_active:
+            # Still in SABR mode - update detection details
+            self.sabr_detection_details = detection_details
+            self.last_sabr_check = time.time()
+            self.log_message("SABR still detected - remaining in bypass mode", "INFO")
+        else:
+            # Not in SABR mode and no SABR detected - no change needed
+            self.log_message("No SABR detected - remaining in normal mode", "INFO")
+    
+    def check_recent_warnings_for_sabr(self):
+        """Check recent log messages for SABR indicators like PO Token warnings."""
+        # Look for SABR indicators in recent operations
+        # This is a heuristic based on common SABR symptoms
+        
+        # Check if we have a console widget with recent messages
+        if hasattr(self, 'console') and hasattr(self.console, 'get'):
+            try:
+                recent_logs = self.console.get('1.0', 'end').lower()
+                sabr_indicators = [
+                    'po token', 'gvs po token', 'require a gvs po token',
+                    'sabr formats require', 'android client sabr formats',
+                    'ios client sabr formats', 'https formats require a gvs po token',
+                    'android client https formats require a gvs po token',
+                    'ios client https formats require a gvs po token'
+                ]
+                
+                for indicator in sabr_indicators:
+                    if indicator in recent_logs:
+                        print(f"SABR indicator found in logs: {indicator}")
+                        return True
+            except Exception as e:
+                print(f"Error checking console logs: {e}")
+        
+        # Also check if we're seeing quality auto-adjustments to low resolutions
+        # This is another strong SABR indicator
+        if hasattr(self, 'console') and hasattr(self.console, 'get'):
+            try:
+                recent_logs = self.console.get('1.0', 'end').lower()
+                if 'quality auto-adjusted' in recent_logs and '360p' in recent_logs:
+                    print("SABR indicator: Quality auto-adjusted to 360p detected")
+                    return True
+            except:
+                pass
+        
+        return False
+    
+    def quick_tv_client_check(self, test_url):
+        """Quick check if TV client has working formats."""
+        try:
+            tv_ydl_opts = {
+                'quiet': True,
+                'skip_download': True,
+                'extractor_args': {'youtube': {'player_client': ['tv']}},
+                'no_warnings': True
+            }
+            
+            with yt_dlp.YoutubeDL(tv_ydl_opts) as ydl:
+                info = ydl.extract_info(test_url, download=False)
+                formats = info.get('formats', [])
+                
+                # Check if TV client has working HTTPS formats
+                tv_https_formats = [
+                    f for f in formats 
+                    if f.get('url', '').startswith('https://')
+                ]
+                
+                return len(tv_https_formats) > 0
+        except:
+            return False
+    
+    def trigger_sabr_detection(self, test_url):
+        """Trigger SABR detection in background thread."""
+        if not test_url:
+            return
+        
+        def run_detection():
+            try:
+                is_sabr_detected, detection_details = self.detect_sabr_mode(test_url)
+                
+                # Update UI on main thread
+                self.root.after(0, self.handle_sabr_detection_result, is_sabr_detected, detection_details)
+            except Exception as e:
+                self.root.after(0, lambda: self.log_message(f"SABR detection failed: {e}", "ERROR"))
+        
+        threading.Thread(target=run_detection, daemon=True).start()
+    
+    def handle_sabr_detection_result(self, is_sabr_detected, detection_details):
+        """Handle SABR detection result on the main thread."""
+        if is_sabr_detected and not self.sabr_mode_active:
+            self.activate_sabr_mode(detection_details)
+        elif not is_sabr_detected:
+            self.last_sabr_check = time.time()  # Mark that we checked
+    
+    def activate_sabr_from_warning(self, warning_msg):
+        """Activate SABR mode immediately when detected from yt-dlp warning."""
+        if self.sabr_mode_active:
+            return  # Already in SABR mode
+        
+        detection_details = {
+            'test_url': 'detected_from_warning',
+            'web_client_sabr': True,
+            'tv_client_working': False,  # Unknown
+            'warnings_detected': [warning_msg],
+            'timestamp': time.time(),
+            'detection_method': 'realtime_warning'
+        }
+        
+        self.log_message(f"SABR detected from yt-dlp warning: {warning_msg[:100]}...", "INFO")
+        self.activate_sabr_mode(detection_details)
+    
+    def manual_sabr_check(self):
+        """Manual SABR check triggered by user button - same as re-check but works from any state."""
+        if not self.download_queue:
+            self.log_message("No videos in queue - adding test URL for SABR check", "INFO")
+            # Use a reliable test URL
+            test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        else:
+            test_url = self.download_queue[0].get('url', '')
+        
+        if not test_url:
+            self.log_message("No valid URL found for SABR check", "WARNING")
+            return
+        
+        self.log_message("Manual SABR check initiated...", "INFO")
+        
+        # Run detection in background thread to avoid blocking UI
+        def run_manual_check():
+            try:
+                is_sabr_detected, detection_details = self.detect_sabr_mode(test_url)
+                
+                # Update UI on main thread using the same logic as re-check
+                self.root.after(0, self.handle_sabr_recheck_result, is_sabr_detected, detection_details)
+            except Exception as e:
+                self.root.after(0, lambda: self.log_message(f"Manual SABR check failed: {e}", "ERROR"))
+        
+        threading.Thread(target=run_manual_check, daemon=True).start()
+    
+    def force_sabr_mode(self):
+        """Force activate SABR mode immediately (for testing when SABR is clearly active)."""
+        if self.sabr_mode_active:
+            self.log_message("SABR mode is already active", "INFO")
+            return
+        
+        detection_details = {
+            'test_url': 'forced_activation',
+            'web_client_sabr': True,
+            'tv_client_working': False,
+            'warnings_detected': ['Manually forced due to visible SABR symptoms'],
+            'timestamp': time.time(),
+            'detection_method': 'manual_force'
+        }
+        
+        self.log_message("Forcing SABR Bypass Mode activation...", "INFO")
+        self.activate_sabr_mode(detection_details)
+
+    def schedule_save_settings(self):
+        """Schedule a delayed save to avoid I/O churn during bulk operations."""
+        if hasattr(self, '_save_settings_after_id') and self._save_settings_after_id:
+            self.root.after_cancel(self._save_settings_after_id)
+        self._save_settings_after_id = self.root.after(1000, self.save_settings)  # Save after 1 second delay
+
+    def _insert_videos_chunked(self, videos, chunk_size=300):
+        """Insert videos in chunks to keep UI responsive during bulk operations."""
+        if not videos:
+            self.update_status_summary()
+            self.schedule_save_settings()
+            return
+        
+        batch, rest = videos[:chunk_size], videos[chunk_size:]
+        for video in batch:
+            duration = video.get('duration', 'N/A')
+            status = video.get('status', 'Pending')
+            item_id = self.tree.insert('', tk.END, values=(self.format_video_id_with_icon(video['id']), video['title'], video['quality'], duration, status), tags=('pending',))
+            video['item_id'] = item_id
+            video['status'] = status
+            self.download_queue.append(video)
+            
+            # Set appropriate color tag based on status
+            if status == 'Downloading':
+                self.tree.item(item_id, tags=('downloading',))
+            elif status == 'Done':
+                self.tree.item(item_id, tags=('done',))
+            elif status == 'Failed':
+                self.tree.item(item_id, tags=('failed',))
+            elif status == 'Skipped':
+                self.tree.item(item_id, tags=('skipped',))
+            else:
+                self.tree.item(item_id, tags=('pending',))
+        
+        self.update_status_summary()
+        if rest:
+            self.root.after(0, lambda: self._insert_videos_chunked(rest, chunk_size))
+        else:
+            self.update_line_numbers()  # Update line numbers after all videos are inserted
+            self.schedule_save_settings()
+
     def save_settings(self):
-        """Saves download path, log level, and queue to the settings file."""
+        """Saves download path, log level, debug setting, and queue to the settings file."""
         try:
             settings = {
                 'download_path': self.download_path.get(),
                 'log_level': self.log_level_var.get(),
                 'audio_format': self.audio_format_var.get(),
-                'queue': [{k: v for k, v in video.items() if k not in ['item_id', 'info']} for video in self.download_queue]  # Exclude 'info' from saving
+                'yt_dlp_debug': self.yt_dlp_debug_var.get(),
+                'console_visible': self.console_visible_var.get(),
+                'queue': [{k: v for k, v in video.items() if k not in ['item_id', 'info']} for video in self.download_queue],  # Exclude 'info' from saving
+                'sabr_mode': {
+                    'active': self.sabr_mode_active,
+                    'last_check': self.last_sabr_check,
+                    'detection_details': self.sabr_detection_details
+                }
             }
             with open(SETTINGS_FILE, 'w') as f:
                 json.dump(settings, f, indent=4)
@@ -1784,6 +3767,26 @@ class YouTubeDownloaderApp:
                 # Load audio format setting
                 audio_format = settings.get('audio_format', 'default (YouTube)')
                 self.audio_format_var.set(audio_format)
+                
+                # Load yt-dlp debug setting
+                yt_dlp_debug = settings.get('yt_dlp_debug', False)
+                self.yt_dlp_debug_var.set(yt_dlp_debug)
+                
+                # Load console visibility setting
+                console_visible = settings.get('console_visible', True)
+                self.console_visible_var.set(console_visible)
+                # Apply the console visibility setting
+                if not console_visible:
+                    self.console.pack_forget()
+                
+                # Load SABR mode settings (but don't auto-restore SABR mode)
+                # SABR mode should only be activated by user actions, not on startup
+                sabr_settings = settings.get('sabr_mode', {})
+                self.sabr_mode_active = False  # Always start with SABR mode disabled
+                self.last_sabr_check = sabr_settings.get('last_check', None)
+                self.sabr_detection_details = sabr_settings.get('detection_details', {})
+                
+                self.log_message("SABR mode starts disabled - will be activated only by user actions", "DEBUG")
 
                 loaded_queue = settings.get('queue', [])
                 if loaded_queue:
